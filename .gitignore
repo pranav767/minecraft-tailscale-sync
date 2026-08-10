@@ -1,0 +1,42 @@
+# Minecraft server files
+*.log
+*.dat_old
+*.dat
+*.mca_old
+*.mcc
+*.mcr
+*.lock
+*.lock.tmp
+*.lock.tmp.*
+*.lock.tmp.*.*
+# ...existing code...
+# Session locks
+session.lock
+
+# Server generated
+usercache.json
+usernamecache.json
+ops.json
+banned-ips.json
+banned-players.json
+whitelist.json
+bukkit.yml
+commands.yml
+help.yml
+permissions.yml
+plugins/
+world/
+world_nether/
+world_the_end/
+
+# OS files
+.DS_Store
+Thumbs.db
+*.swp
+*.swo
+*~
+
+# IDE
+.vscode/
+.idea/
+*.iml
