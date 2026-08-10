@@ -1,42 +1,63 @@
 # Minecraft Tailscale Sync 🎮
 
-Two-player Minecraft setup with **Cloud Storage** + **Tailscale** + **Discord Webhook**.
+Two-player Minecraft setup with **rsync** (fast handoff) + **Cloud Storage** (fallback + backup).
 
 You and a friend run separate Minecraft servers on your own machines. This setup:
 
-1. **World data lives in the cloud** (S3 / Backblaze B2 / any S3-compatible storage)
-2. **Downloads on start, uploads on stop** — no sync conflicts, no daemon needed
-3. **Prevents conflicts** — only one server runs at a time
-4. **Posts to Discord** via a simple webhook when a server starts/stops
+1. **Fast handoff** — uses `rsync` over Tailscale when both machines are online (incremental, seconds)
+2. **Cloud fallback** — falls back to cloud storage (S3/B2) when the other machine is offline
+3. **Cloud backup** — always backs up the world to cloud on shutdown (acts as safety net)
+4. **Prevents conflicts** — only one server runs at a time
+5. **Posts to Discord** via a simple webhook when a server starts/stops
 
-## Why Cloud Storage?
+## Why Hybrid?
 
-| Approach | Problem |
-|---|---|
-| **rsync** | ❌ Fails when the other machine is offline — world data never moves |
-| **Syncthing** | ⚠️ If both servers somehow run, conflict files appear → world corruption risk |
-| **Cloud Storage** | ✅ Single source of truth. Download → play → upload. No conflicts possible. |
+| Approach | Daily handoff speed | Works when other is offline? | Corruption risk? |
+|---|---|---|---|
+| **rsync only** | ⚡ Fast (seconds) | ❌ No — world data stuck | ✅ None |
+| **Cloud only** | 🐢 Slow (download+upload GBs) | ✅ Yes | ✅ None |
+| **Hybrid (this repo)** | ⚡ Fast (seconds) **or** 🐢 cloud fallback | ✅ Yes | ✅ None |
 
 ## How It Works
+
+```
+Normal handoff (both machines online recently):
+  Start → rsync from friend's machine (only changed chunks = seconds)
+  Stop  → rsync to friend + rclone backup to cloud
+
+Edge case (other machine offline):
+  Start → rclone download from cloud (fallback)
+  Stop  → rclone upload to cloud (backup)
+         → rsync attempts to friend (skips if offline)
+```
+
+### What about a 2GB+ world?
+
+Good concern. Here's how it breaks down:
+
+- **rsync** is **incremental** — after the first sync, it only transfers chunks that changed. Most days: **5-30 seconds**
+- **rclone** to cloud is also **incremental** — only uploads new/changed region files. A 30-minute play session might add only **5-50MB** of changes
+- Full download from cloud only happens if:
+  - It's the **very first time** (one-time ~5 min for 2GB)
+  - The other machine has been offline for a long time and there's no local copy
+
+**In practice:** 90% of handoffs use rsync (seconds). Cloud is just a safety net.
 
 ```
                     ┌──────────────────────┐
                     │   Cloud Storage      │
                     │  (S3 / B2 / R2)      │
-                    │                      │
                     │     world/           │
                     └──┬───────────────┬───┘
-                       │               │
-                 download           download
-                 on start           on start
-                 upload             upload
-                 on stop            on stop
-                       │               │
+                       │   backup      │  fallback
+                       │   (always)    │  (when offline)
               ┌────────┴──────┐  ┌────┴────────┐
               │ Your Machine  │  │ Friend's    │
               │ Server A      │  │ Server B    │
               │ 100.x.x.1     │  │ 100.x.x.2   │
               └───────┬───────┘  └──────┬───────┘
+                      │  rsync ◄──────► │
+                      │  (fast path)    │
                       │                 │
                       │  Discord        │
                       │  Webhook        │
@@ -50,22 +71,20 @@ You and a friend run separate Minecraft servers on your own machines. This setup
                   └──────────────────┘
 ```
 
-**No sync daemon. No conflict files. Just download, play, upload.**
-
 ## Prerequisites
 
 - [Tailscale](https://tailscale.com/) installed on both machines
-- Both machines can reach each other's Tailscale IP on port `25565`
+- Both machines pingable on their Tailscale IPs
 - [rclone](https://rclone.org/) installed on both machines
 - An S3-compatible storage bucket (Backblaze B2, AWS S3, Cloudflare R2, etc.)
 - Discord channel with a [Webhook](https://support.discord.com/hc/en-us/articles/228383668-Intro-to-Webhooks) created
-- `nc` (netcat) and `curl` available on both machines
+- `rsync`, `nc` (netcat), and `curl` available on both machines
 
 ## Setup
 
 ### 0. Configure Cloud Storage with rclone
 
-On **both machines**, install rclone and set up your storage:
+On **both machines**:
 
 ```bash
 # Install rclone
@@ -75,15 +94,12 @@ sudo -v ; curl https://rclone.org/install.sh | sudo bash
 rclone config
 ```
 
-**Recommended:** Backblaze B2 — ~$0.006/GB/month. A Minecraft world is ~100MB = less than a penny per month.
+**Recommended:** Backblaze B2 — ~$0.006/GB/month. A 2GB world = ~1.2 cents/month.
 
-Follow the prompts to create a remote. Then test it:
+Test it:
 
 ```bash
-# Create a bucket (B2 example)
 rclone mkdir minecraft-b2:minecraft-world-bucket
-
-# Test it works
 rclone ls minecraft-b2:minecraft-world-bucket
 ```
 
@@ -96,7 +112,7 @@ cd /opt/minecraft
 
 ### 2. Configure the script
 
-Edit `start-minecraft.sh` and set these variables:
+Edit `start-minecraft.sh`:
 
 | Variable | Your Machine | Friend's Machine |
 |---|---|---|
@@ -105,7 +121,7 @@ Edit `start-minecraft.sh` and set these variables:
 | `OTHER_TAILSCALE_IP` | Friend's Tailscale IP | Your Tailscale IP |
 | `DISCORD_WEBHOOK_URL` | Same webhook URL | Same webhook URL |
 | `MINECRAFT_DIR` | Path to server dir | Path to server dir |
-| `RCLONE_REMOTE` | Your rclone remote + bucket | Same rclone remote + bucket |
+| `RCLONE_REMOTE` | Your rclone remote:bucket | Same rclone remote:bucket |
 
 ### 3. Make it executable
 
@@ -119,13 +135,22 @@ chmod +x /opt/minecraft/start-minecraft.sh
 ./start-minecraft.sh
 ```
 
-The script will:
-1. ✅ Check the other server isn't already running
-2. 📥 Download the latest world from cloud storage
-3. 🟢 Post "Online!" to Discord
-4. 🎮 Start Minecraft
-5. On shutdown: 📤 Upload world to cloud
-6. 🔴 Post "Offline" to Discord
+## What Happens on Each Action
+
+```
+START:
+  ├─ Check: other server online? → Yes → ❌ Refuse, warn Discord
+  ├─ Try rsync from friend → Success → ✅ Got latest world (seconds)
+  └─ rsync failed → rclone from cloud → ✅ Got latest world (slower)
+  └─ Discord: 🟢 "Server A is Online!"
+  └─ java -jar server.jar
+
+STOP:
+  ├─ rclone to cloud (always) → 💾 Backup safe
+  ├─ Try rsync to friend → Success → ✅ Friend has it immediately
+  └─ rsync failed → Friend gets it from cloud next time
+  └─ Discord: 🔴 "Server A is Offline"
+```
 
 ## Discord Notifications
 
@@ -135,23 +160,32 @@ The script will:
 | Server stopped | 🔴 Red | "Server A is Offline. World saved to cloud." |
 | Conflict blocked | 🟡 Orange | "Server A tried to start but B is already online!" |
 
-## Handoff Flow
+## Handoff Scenarios
 
+### Best case (both online recently)
 ```
-1. Friend plays on Server B, builds cool stuff
-2. Friend stops Server B → world uploads to cloud
-3. You start Server A → world downloads from cloud
-4. You see everything friend built! Play on Server A
-5. You stop Server A → world uploads to cloud
-6. Friend starts Server B → world downloads from cloud
-7. Friend sees everything you built! Continue playing
+Friend stops B → rsyncs to you in 5 seconds
+You start A → rsyncs from friend in 5 seconds → play immediately
+```
+
+### Worst case (you played, friend was offline, now friend wants to play)
+```
+You stop A → rclone uploads to cloud (only changed chunks = fast)
+Next day, friend starts B → rclone downloads from cloud → plays
+```
+
+### First time ever
+```
+You start A → no rsync target, no cloud data → fresh world
+You play, build, stop → rclone uploads to cloud
+Friend starts B → rclone downloads from cloud → continues your build!
 ```
 
 ## Auto-Start
 
-The Minecraft server should be started manually (so you don't accidentally run both). But if you want auto-start:
+Minecraft should be started manually to avoid accidentally running both. But if desired:
 
-### Ubuntu — systemd service
+### Ubuntu — systemd
 
 ```bash
 sudo nano /etc/systemd/system/minecraft.service
@@ -174,7 +208,7 @@ Restart=no
 WantedBy=multi-user.target
 ```
 
-### Talos Linux — Docker
+### Talos — Docker
 
 ```bash
 docker run -d \
@@ -186,21 +220,29 @@ docker run -d \
   itzg/minecraft-server:latest
 ```
 
-### Crontab @reboot (both OS)
+### Crontab (both)
 
 ```bash
 crontab -e
-# Add:
 @reboot /opt/minecraft/start-minecraft.sh >> /var/log/minecraft.log 2>&1
 ```
+
+## Performance Summary
+
+| World Size | rsync handoff (normal) | Cloud fallback (first time) | Cloud backup (incremental) |
+|---|---|---|---|
+| 100 MB | ~1s | ~30s | ~1-5s |
+| 500 MB | ~3s | ~2min | ~5-15s |
+| 2 GB | ~10s | ~5min | ~10-30s |
+| 10 GB | ~45s | ~25min | ~30s-2min |
+
+After the first sync, **rsync and rclone only transfer changed chunks**, so daily use is fast regardless of world size.
 
 ## Notes
 
 - Only **one** server should run at a time — the script enforces this
-- World data is stored in the cloud — no sync conflicts, no corruption risk
-- Works even if machines are never online at the same time
-- Backblaze B2 costs ~$0.006/GB/month — a Minecraft world is pennies
-- Talos Linux, Ubuntu, Debian, Raspberry Pi — works on anything with bash + curl
+- Cloud storage acts as backup + fallback; rsync is the fast path
+- Talos Linux, Ubuntu, Debian, Raspberry Pi — works on anything with bash
 
 - Only **one** server should run at a time — the script enforces this
 - Syncthing syncs the `world/` folder in real-time, so you always have the latest data
