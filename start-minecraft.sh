@@ -1,6 +1,7 @@
 #!/bin/bash
-# Minecraft Server Startup Script with Sync + Discord Webhook
-# Place this on both machines, configure the variables below
+# Minecraft Server Startup Script with Cloud Storage + Discord Webhook
+# World data lives in the cloud. Each machine downloads on start, uploads on stop.
+# No sync conflicts, no daemon needed, works even if machines are never online together.
 
 # ===== CONFIGURATION =====
 SERVER_NAME="server-a"     # Change to "server-b" on friend's machine
@@ -9,13 +10,17 @@ OTHER_SERVER_NAME="server-b"
 OTHER_TAILSCALE_IP="100.x.x.2"  # Friend's Tailscale IP
 MINECRAFT_PORT=25565
 MINECRAFT_DIR="/opt/minecraft/server"
-SYNC_DIR="/opt/minecraft/synced"
 JAR_FILE="server.jar"
 JAVA_ARGS="-Xmx4G -Xms2G -jar $JAR_FILE nogui"
 
 # Discord Webhook URL — create one in your Discord channel:
 #   Channel Settings → Integrations → Webhooks → New Webhook
 DISCORD_WEBHOOK_URL="https://discord.com/api/webhooks/YOUR_WEBHOOK_ID/YOUR_WEBHOOK_TOKEN"
+
+# rclone remote name (configured with `rclone config`)
+# Using Backblaze B2 is ~$0.006/GB/month — a Minecraft world costs pennies
+# Or use any S3-compatible storage
+RCLONE_REMOTE="minecraft-b2:minecraft-world-bucket"
 
 # ===== DISCORD WEBHOOK =====
 
@@ -39,27 +44,27 @@ EOF
     )" > /dev/null
 }
 
+# ===== CLOUD SYNC =====
+
+download_world() {
+    echo "=== Downloading world from cloud storage ==="
+    rclone sync "$RCLONE_REMOTE/world" "$MINECRAFT_DIR/world" \
+        --progress --verbose
+    echo "=== Download complete ==="
+}
+
+upload_world() {
+    echo "=== Uploading world to cloud storage ==="
+    rclone sync "$MINECRAFT_DIR/world" "$RCLONE_REMOTE/world" \
+        --progress --verbose
+    echo "=== Upload complete ==="
+}
+
 # ===== FUNCTIONS =====
 
 is_other_server_online() {
     nc -z -w 3 "$OTHER_TAILSCALE_IP" "$MINECRAFT_PORT" 2>/dev/null
     return $?
-}
-
-sync_from_other() {
-    echo "=== Syncing world data from $OTHER_SERVER_NAME ==="
-    rsync -avz --progress \
-        --exclude='server-status.json' \
-        "$OTHER_TAILSCALE_IP:$MINECRAFT_DIR/" "$MINECRAFT_DIR/"
-    echo "=== Sync complete ==="
-}
-
-sync_to_other() {
-    echo "=== Pushing world data to $OTHER_SERVER_NAME ==="
-    rsync -avz --progress \
-        --exclude='server-status.json' \
-        "$MINECRAFT_DIR/" "$OTHER_TAILSCALE_IP:$MINECRAFT_DIR/"
-    echo "=== Push complete ==="
 }
 
 # ===== MAIN =====
@@ -74,9 +79,9 @@ if is_other_server_online; then
     exit 1
 fi
 
-# 2. Sync latest world data from the other machine
-echo "Checking for latest world data..."
-sync_from_other
+# 2. Download latest world from cloud
+echo "Downloading latest world data..."
+download_world
 
 # 3. Notify Discord — server is starting
 send_discord 65280 "🟢 $SERVER_LABEL is Online!" \
@@ -90,17 +95,12 @@ java $JAVA_ARGS
 # ===== ON SHUTDOWN =====
 echo "=== Server stopping... ==="
 
-# 5. Push latest data to the other machine
-sync_to_other
+# 5. Upload world to cloud
+echo "Uploading world data to cloud..."
+upload_world
 
 # 6. Notify Discord — server is offline
 send_discord 16711680 "🔴 $SERVER_LABEL is Offline" \
-    "Minecraft server **$SERVER_LABEL** has shut down. World data has been synced."
-
-echo "=== $SERVER_NAME stopped ==="
-update_status_file "false"
-
-# 7. Push latest data to the other machine
-sync_to_other
+    "Minecraft server **$SERVER_LABEL** has shut down. World saved to cloud."
 
 echo "=== $SERVER_NAME stopped ==="

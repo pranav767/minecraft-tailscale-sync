@@ -1,61 +1,91 @@
 # Minecraft Tailscale Sync 🎮
 
-Two-player Minecraft setup with **Tailscale** + **rsync** + **Discord Webhook**.
+Two-player Minecraft setup with **Cloud Storage** + **Tailscale** + **Discord Webhook**.
 
 You and a friend run separate Minecraft servers on your own machines. This setup:
 
-1. **Syncs world data** between machines via Tailscale + rsync
-2. **Prevents conflicts** — only one server runs at a time
-3. **Posts to Discord** via a simple webhook when a server starts/stops
+1. **World data lives in the cloud** (S3 / Backblaze B2 / any S3-compatible storage)
+2. **Downloads on start, uploads on stop** — no sync conflicts, no daemon needed
+3. **Prevents conflicts** — only one server runs at a time
+4. **Posts to Discord** via a simple webhook when a server starts/stops
+
+## Why Cloud Storage?
+
+| Approach | Problem |
+|---|---|
+| **rsync** | ❌ Fails when the other machine is offline — world data never moves |
+| **Syncthing** | ⚠️ If both servers somehow run, conflict files appear → world corruption risk |
+| **Cloud Storage** | ✅ Single source of truth. Download → play → upload. No conflicts possible. |
 
 ## How It Works
 
 ```
-┌─────────────────┐    Tailscale     ┌─────────────────┐
-│  Your Machine   │◄───────────────►│  Friend's Machine│
-│  Server A       │   rsync over     │  Server B        │
-│  100.x.x.1      │   WireGuard      │  100.x.x.2       │
-└────────┬────────┘                  └────────┬────────┘
-         │                                    │
-         │         Discord Webhook            │
-         └────────────────┬───────────────────┘
-                          │
-                          ▼
-                ┌──────────────────┐
-                │   Discord Chat   │
-                │ 🟢 A is Online!  │
-                │ 🔴 A is Offline  │
-                └──────────────────┘
+                    ┌──────────────────────┐
+                    │   Cloud Storage      │
+                    │  (S3 / B2 / R2)      │
+                    │                      │
+                    │     world/           │
+                    └──┬───────────────┬───┘
+                       │               │
+                 download           download
+                 on start           on start
+                 upload             upload
+                 on stop            on stop
+                       │               │
+              ┌────────┴──────┐  ┌────┴────────┐
+              │ Your Machine  │  │ Friend's    │
+              │ Server A      │  │ Server B    │
+              │ 100.x.x.1     │  │ 100.x.x.2   │
+              └───────┬───────┘  └──────┬───────┘
+                      │                 │
+                      │  Discord        │
+                      │  Webhook        │
+                      └─────┬───────────┘
+                            │
+                            ▼
+                  ┌──────────────────┐
+                  │   Discord Chat   │
+                  │ 🟢 A is Online!  │
+                  │ 🔴 A is Offline  │
+                  └──────────────────┘
 ```
+
+**No sync daemon. No conflict files. Just download, play, upload.**
 
 ## Prerequisites
 
 - [Tailscale](https://tailscale.com/) installed on both machines
 - Both machines can reach each other's Tailscale IP on port `25565`
+- [rclone](https://rclone.org/) installed on both machines
+- An S3-compatible storage bucket (Backblaze B2, AWS S3, Cloudflare R2, etc.)
 - Discord channel with a [Webhook](https://support.discord.com/hc/en-us/articles/228383668-Intro-to-Webhooks) created
-- `rsync`, `nc` (netcat), and `curl` available on both machines
-
-## ⚠️ Important: What About Syncthing?
-
-**You don't need Syncthing.** The script uses `rsync` directly over Tailscale to sync world data. Here's why:
-
-- **rsync over Tailscale** is already fast, encrypted, and direct — no third-party service needed
-- **Syncthing would cause conflicts** — if both servers somehow ran at the same time, Syncthing would try to merge two independently-modified worlds, corrupting chunks and causing data loss
-- **rsync is one-directional** — the script always syncs from the *last running* server to the *next starting* server, which is exactly what you want
-
-### What If Both Servers Are On at the Same Time?
-
-The script **prevents this** — but here's what happens in each scenario:
-
-| Scenario | What Happens |
-|---|---|
-| **Script is used correctly** | ✅ The `is_other_server_online()` check pings the other machine's port. If it's reachable, the script **refuses to start** and sends a ⚠️ warning to Discord |
-| **Someone bypasses the script** (runs `java -jar` directly) | ⚠️ Both servers run independently. Worlds **diverge** — changes on A are lost when B syncs next. Players might see different worlds. **Don't do this.** |
-| **Network issue / Tailscale down** | ❌ The port check fails to detect the other server. Both could start. The Discord webhook will also fail silently. |
-
-**Bottom line:** Always use the script to start the server, and make sure Tailscale is running. The script is your safety net.
+- `nc` (netcat) and `curl` available on both machines
 
 ## Setup
+
+### 0. Configure Cloud Storage with rclone
+
+On **both machines**, install rclone and set up your storage:
+
+```bash
+# Install rclone
+sudo -v ; curl https://rclone.org/install.sh | sudo bash
+
+# Configure your storage provider
+rclone config
+```
+
+**Recommended:** Backblaze B2 — ~$0.006/GB/month. A Minecraft world is ~100MB = less than a penny per month.
+
+Follow the prompts to create a remote. Then test it:
+
+```bash
+# Create a bucket (B2 example)
+rclone mkdir minecraft-b2:minecraft-world-bucket
+
+# Test it works
+rclone ls minecraft-b2:minecraft-world-bucket
+```
 
 ### 1. Clone the repo on each machine
 
@@ -74,47 +104,54 @@ Edit `start-minecraft.sh` and set these variables:
 | `SERVER_LABEL` | `"Your Server"` | `"Friend's Server"` |
 | `OTHER_TAILSCALE_IP` | Friend's Tailscale IP | Your Tailscale IP |
 | `DISCORD_WEBHOOK_URL` | Same webhook URL | Same webhook URL |
-| `MINECRAFT_DIR` | Path to your server dir | Path to your server dir |
+| `MINECRAFT_DIR` | Path to server dir | Path to server dir |
+| `RCLONE_REMOTE` | Your rclone remote + bucket | Same rclone remote + bucket |
 
-### 3. Make the script executable
+### 3. Make it executable
 
 ```bash
 chmod +x /opt/minecraft/start-minecraft.sh
 ```
 
-### 4. Run it!
+### 4. Start Minecraft!
 
 ```bash
 ./start-minecraft.sh
 ```
 
-This replaces your normal `java -jar server.jar` command.
+The script will:
+1. ✅ Check the other server isn't already running
+2. 📥 Download the latest world from cloud storage
+3. 🟢 Post "Online!" to Discord
+4. 🎮 Start Minecraft
+5. On shutdown: 📤 Upload world to cloud
+6. 🔴 Post "Offline" to Discord
 
 ## Discord Notifications
-
-The script sends embedded Discord messages via webhook:
 
 | Event | Color | Message |
 |---|---|---|
 | Server started | 🟢 Green | "Server A is Online!" |
-| Server stopped | 🔴 Red | "Server A is Offline. World synced." |
-| Conflict | 🟡 Orange | "Server A tried to start but B is already online!" |
+| Server stopped | 🔴 Red | "Server A is Offline. World saved to cloud." |
+| Conflict blocked | 🟡 Orange | "Server A tried to start but B is already online!" |
 
 ## Handoff Flow
 
-1. **Server A** starts → syncs world from B (if B was last online) → notifies Discord
-2. Players join Server A, play, build stuff
-3. **Server A** stops → pushes world data to B → notifies Discord
-4. **Server B** starts → pulls latest world from A → notifies Discord
-5. Players join Server B and continue where they left off
+```
+1. Friend plays on Server B, builds cool stuff
+2. Friend stops Server B → world uploads to cloud
+3. You start Server A → world downloads from cloud
+4. You see everything friend built! Play on Server A
+5. You stop Server A → world uploads to cloud
+6. Friend starts Server B → world downloads from cloud
+7. Friend sees everything you built! Continue playing
+```
 
-## 🤖 Auto-Start on Boot
+## Auto-Start
 
-You don't want to run the script manually every time. Here's how to set it up for each OS.
+The Minecraft server should be started manually (so you don't accidentally run both). But if you want auto-start:
 
-### Ubuntu / Debian (Friend's Machine) — systemd Service
-
-Create a service file:
+### Ubuntu — systemd service
 
 ```bash
 sudo nano /etc/systemd/system/minecraft.service
@@ -123,7 +160,7 @@ sudo nano /etc/systemd/system/minecraft.service
 ```ini
 [Unit]
 Description=Minecraft Server
-After=network-online.target tailscaled.service
+After=network-online.target
 Wants=network-online.target
 
 [Service]
@@ -131,117 +168,41 @@ Type=simple
 User=minecraft
 WorkingDirectory=/opt/minecraft/server
 ExecStart=/opt/minecraft/start-minecraft.sh
-Restart=on-failure
-RestartSec=10
+Restart=no
 
 [Install]
 WantedBy=multi-user.target
 ```
 
-Enable it to start on boot:
+### Talos Linux — Docker
 
 ```bash
-sudo systemctl daemon-reload
-sudo systemctl enable minecraft.service
-sudo systemctl start minecraft.service   # starts now
-sudo systemctl status minecraft.service  # check status
-```
-
-### Talos Linux (Your Machine)
-
-Talos Linux doesn't have systemd. You have a few options depending on how you run Minecraft:
-
-#### Option A: If running as a static pod (recommended for Talos)
-
-Create a static pod manifest. The script runs in a sidecar init container, or you can run the whole thing in a container:
-
-```yaml
-# /var/lib/rancher/kubelet/static-pods/minecraft.yaml
-apiVersion: v1
-kind: Pod
-metadata:
-  name: minecraft-server
-  namespace: default
-  labels:
-    app: minecraft
-spec:
-  hostNetwork: true  # Needed for Tailscale reachability
-  containers:
-  - name: minecraft
-    image: itzg/minecraft-server:latest
-    env:
-    - name: EULA
-      value: "TRUE"
-    - name: ONLINE_MODE
-      value: "false"
-    ports:
-    - containerPort: 25565
-    volumeMounts:
-    - name: data
-      mountPath: /data
-  - name: sync-sidecar
-    image: alpine:latest
-    command:
-    - /bin/sh
-    - -c
-    - |
-      apk add --no-cache rsync curl netcat-openbsd
-      # Copy the script and run it
-      /opt/minecraft/start-minecraft.sh
-    volumeMounts:
-    - name: data
-      mountPath: /data
-    - name: scripts
-      mountPath: /opt/minecraft
-  volumes:
-  - name: data
-    hostPath:
-      path: /opt/minecraft/server
-  - name: scripts
-    hostPath:
-      path: /opt/minecraft
-```
-
-#### Option B: If running as a regular process on Talos (using `talosctl`)
-
-Talos supports running arbitrary containers via `talosctl`. Wrap the script in a container:
-
-```dockerfile
-# Dockerfile
-FROM alpine:latest
-RUN apk add --no-cache bash rsync curl netcat-openbsd openjdk17-jre
-COPY start-minecraft.sh /start-minecraft.sh
-RUN chmod +x /start-minecraft.sh
-CMD ["/start-minecraft.sh"]
-```
-
-Then build and run with:
-
-```bash
-docker build -t minecraft-sync .
-docker run -d --name minecraft \
+docker run -d \
+  --restart unless-stopped \
+  --name minecraft \
   --network host \
-  -v /opt/minecraft/server:/opt/minecraft/server \
-  minecraft-sync
+  -v /opt/minecraft:/opt/minecraft \
+  -v /home/user/.config/rclone:/home/user/.config/rclone \
+  itzg/minecraft-server:latest
 ```
 
-And set it to restart automatically via a Talos scheduled task or your container runtime's restart policy.
-
-#### Option C: Crontab @reboot
-
-Simplest option — works on both Talos and Ubuntu if you have a traditional shell:
+### Crontab @reboot (both OS)
 
 ```bash
 crontab -e
-```
-
-Add this line:
-```
+# Add:
 @reboot /opt/minecraft/start-minecraft.sh >> /var/log/minecraft.log 2>&1
 ```
 
 ## Notes
 
 - Only **one** server should run at a time — the script enforces this
-- Syncthing is **not recommended** — rsync over Tailscale is faster and safer for this use case
+- World data is stored in the cloud — no sync conflicts, no corruption risk
+- Works even if machines are never online at the same time
+- Backblaze B2 costs ~$0.006/GB/month — a Minecraft world is pennies
+- Talos Linux, Ubuntu, Debian, Raspberry Pi — works on anything with bash + curl
+
+- Only **one** server should run at a time — the script enforces this
+- Syncthing syncs the `world/` folder in real-time, so you always have the latest data
+- Script uses a local lock file (`.server-lock.json`) to track who was last online
 - Talos Linux, Ubuntu, Debian, Raspberry Pi — works on anything with bash + curl
