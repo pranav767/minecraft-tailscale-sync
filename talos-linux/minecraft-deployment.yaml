@@ -86,7 +86,8 @@ spec:
             - -c
             - |
               set -euo pipefail
-              apk add --no-cache rclone curl netcat-openbsd
+              # Install packages once at startup (not in preStop — that times out)
+              apk add --no-cache rclone rsync curl netcat-openbsd
 
               echo "=== Sync agent started ==="
 
@@ -140,8 +141,7 @@ spec:
                   - /bin/sh
                   - -c
                   - |
-                    set -euo pipefail
-                    apk add --no-cache rclone rsync curl netcat-openbsd
+                    # Don't use set -e — we want to try everything even if something fails
                     ts="shutdown-$(date -u +%Y%m%d-%H%M%S)"
 
                     # Wait for Minecraft to finish saving
@@ -152,7 +152,7 @@ spec:
                     echo "=== Uploading world to cloud ==="
                     rclone sync "$MINECRAFT_DIR/world" "$RCLONE_REMOTE/world" \
                       --progress --verbose \
-                      --backup-dir "$RCLONE_REMOTE/backups/$ts"
+                      --backup-dir "$RCLONE_REMOTE/backups/$ts" || echo "WARNING: rclone sync failed"
                     echo "=== Upload complete ==="
 
                     # OPTIMIZATION: Try rsync to friend (fast handoff if both stopped)
@@ -161,17 +161,19 @@ spec:
                         if ! nc -z -w 3 "$OTHER_TAILSCALE_IP" "$MINECRAFT_PORT" 2>/dev/null; then
                           echo "=== Rsyncing world to $OTHER_SERVER_NAME ==="
                           rsync -avz --progress \
-                            "$MINECRAFT_DIR/world" "$OTHER_TAILSCALE_IP:$MINECRAFT_DIR/world"
+                            "$MINECRAFT_DIR/world" "$OTHER_TAILSCALE_IP:$MINECRAFT_DIR/world" || echo "WARNING: rsync failed"
                           echo "=== rsync complete ==="
                         fi
                       fi
                     fi
 
-                    # Get Tailscale IP (still available during preStop)
-                    offline_ip=$(ip -4 addr show tailscale0 2>/dev/null | grep inet | awk '{print $2}' | cut -d/ -f1 | head -1)
-                    if [ -z "$offline_ip" ]; then
-                      offline_ip="unknown"
+                    # Get Tailscale IP (may be gone if tailscale container already stopped)
+                    offline_ip="unknown"
+                    if ip -4 addr show tailscale0 2>/dev/null; then
+                      offline_ip=$(ip -4 addr show tailscale0 2>/dev/null | grep inet | awk '{print $2}' | cut -d/ -f1 | head -1)
                     fi
+                    [ -z "$offline_ip" ] && offline_ip="unknown"
+
                     # Get world size
                     world_size=$(du -sh "$MINECRAFT_DIR/world" 2>/dev/null | cut -f1)
                     [ -z "$world_size" ] && world_size="unknown"
@@ -179,7 +181,7 @@ spec:
                     # Notify Discord
                     curl -s -H "Content-Type: application/json" \
                       -X POST "$DISCORD_WEBHOOK_URL" \
-                      -d "{\"embeds\":[{\"title\":\"🔴 $SERVER_NAME is Offline\",\"description\":\"**$SERVER_NAME** has shut down.\\n📡 **Was at:** \`$offline_ip\`\\n💾 **World size:** $world_size\\n☁️ **Backed up** to cloud with \`--backup-dir\`\\n\\nThe other server can now be started safely.\",\"color\":16711680,\"timestamp\":\"$(date -u +%Y%m%dT%H%M%SZ)\"}]}" > /dev/null
+                      -d "{\"embeds\":[{\"title\":\"🔴 $SERVER_NAME is Offline\",\"description\":\"**$SERVER_NAME** has shut down.\\n📡 **Was at:** \`$offline_ip\`\\n💾 **World size:** $world_size\\n☁️ **Backed up** to cloud with \`--backup-dir\`\\n\\nThe other server can now be started safely.\",\"color\":16711680,\"timestamp\":\"$(date -u +%Y%m%dT%H%M%SZ)\"}]}" > /dev/null || echo "WARNING: Discord notification failed"
                     echo "=== Server offline notification sent ==="
           env:
             - name: SERVER_NAME
