@@ -4,6 +4,42 @@ Two-player Minecraft sync across **Talos Linux** (Kubernetes) and **Ubuntu** (ba
 
 You and a friend run separate Minecraft servers on your own machines. This setup keeps the world in sync no matter which server is running — with a **cloud-first** architecture that prioritizes data safety over speed.
 
+## Quick Command Reference
+
+### 🟢 Start Server
+
+| Machine | Command |
+|---|---|
+| **Talos** | `kubectl -n games scale deployment minecraft --replicas=1` |
+| **Ubuntu** | `cd /opt/minecraft && ./start-minecraft.sh` |
+
+### 🔴 Stop Server
+
+| Machine | Command |
+|---|---|
+| **Talos** | `kubectl -n games scale deployment minecraft --replicas=0` |
+| **Ubuntu** | Press `Ctrl+C` or `kill` the process — backup happens automatically |
+
+### 🔄 Restart (stop + backup + download + start)
+
+| Machine | Command |
+|---|---|
+| **Talos** | `kubectl -n games rollout restart deployment minecraft` |
+| **Ubuntu** | `Ctrl+C` then `./start-minecraft.sh` again |
+
+### 📋 Check Status
+
+| Machine | Command |
+|---|---|
+| **Talos** | `kubectl -n games get pods` |
+| **Ubuntu** | Look at terminal output |
+
+### 📡 Connect to Server
+
+Use your **Tailscale machine IP** on port **25565** (shown in Discord when it starts).
+
+---
+
 ## The Architecture
 
 ```
@@ -205,12 +241,14 @@ chmod +x /opt/minecraft/start-minecraft.sh
 ### 2.5 Start/Stop
 
 ```bash
-# Start
+# 🟢 Start server (downloads world from cloud, notifies Discord)
 cd /opt/minecraft && ./start-minecraft.sh
 
-# Stop — press Ctrl+C or kill the process
-# The script handles cloud backup automatically on shutdown
+# 🔴 Stop server (press Ctrl+C or send SIGTERM)
+# The script handles: cloud backup → rsync to friend → Discord notification
 ```
+
+That's it. The script does everything automatically.
 
 ---
 
@@ -278,26 +316,37 @@ The `minecraft-deployment.yaml` runs three containers in one pod:
 
 Plus an **init container** (`sync-pre-start`) that downloads the world from cloud before Minecraft starts.
 
-### 3.5 Manage the server
+### 3.5 Start/Stop
 
 ```bash
-# View logs
-kubectl -n games logs -l app=minecraft
-
-# Watch the sync agent specifically
-kubectl -n games logs -l app=minecraft -c sync-agent -f
-
-# Stop server (triggers cloud backup)
-kubectl -n games scale deployment minecraft --replicas=0
-
-# Start server (downloads world from cloud)
+# 🟢 Start server (downloads world from cloud, notifies Discord)
 kubectl -n games scale deployment minecraft --replicas=1
 
-# Restart (stop → backup → start → download)
-kubectl -n games rollout restart deployment minecraft
+# 🔴 Stop server (triggers cloud backup → rsync → Discord notification)
+kubectl -n games scale deployment minecraft --replicas=0
 
-# Connect to Minecraft — use the Talos node's IP on port 30565 (NodePort)
+# 🔄 Restart (stop → backup → download world → start)
+kubectl -n games rollout restart deployment minecraft
 ```
+
+### 3.6 Monitoring
+
+```bash
+# View all container logs
+kubectl -n games logs -l app=minecraft
+
+# Watch sync agent logs (periodic backups, Discord)
+kubectl -n games logs -l app=minecraft -c sync-agent -f
+
+# Watch Minecraft server logs
+kubectl -n games logs -l app=minecraft -c minecraft -f
+```
+
+### 3.7 Connect
+
+Use the **Tailscale IP** of the pod on port **25565**. The IP is shown in the Discord message when the server starts.
+
+Or connect via the Talos node IP on port **30565** (NodePort).
 
 ---
 
