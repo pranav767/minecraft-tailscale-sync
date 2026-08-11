@@ -1,0 +1,245 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: minecraft
+  namespace: games
+spec:
+  replicas: 1
+  strategy:
+    type: Recreate
+  selector:
+    matchLabels:
+      app: minecraft
+  template:
+    metadata:
+      labels:
+        app: minecraft
+    spec:
+      # Give preStop hooks time to upload large worlds (5 min)
+      terminationGracePeriodSeconds: 300
+
+      # Init container: download world from cloud (no Tailscale needed)
+      initContainers:
+        - name: sync-pre-start
+          image: alpine:3.19
+          command:
+            - /bin/sh
+            - -c
+            - |
+              set -euo pipefail
+              apk add --no-cache rclone
+
+              echo "=== Downloading world from cloud ==="
+              rclone sync "$RCLONE_REMOTE/world" "$MINECRAFT_DIR/world" \
+                --progress --verbose
+              echo "=== Download complete ==="
+          env:
+            - name: MINECRAFT_DIR
+              value: /data
+            - name: RCLONE_REMOTE
+              value: "minecraft-b2:minecraft-world-bucket"
+          volumeMounts:
+            - name: data
+              mountPath: /data
+            - name: rclone-config
+              mountPath: /root/.config/rclone
+          resources:
+            requests:
+              cpu: 200m
+              memory: 128Mi
+            limits:
+              cpu: 1
+              memory: 512Mi
+
+      containers:
+        # --- Minecraft Server ---
+        - name: minecraft
+          image: itzg/minecraft-server:latest
+          env:
+            - name: EULA
+              value: "TRUE"
+            - name: MEMORY
+              value: "1536M"
+            - name: TYPE
+              value: "PAPER"
+            - name: VERSION
+              value: "26.2"
+            - name: PAPER_BUILD
+              value: "55"
+          ports:
+            - containerPort: 25565
+          resources:
+            requests:
+              memory: "1536Mi"
+              cpu: "500m"
+            limits:
+              memory: "2048Mi"
+          volumeMounts:
+            - name: data
+              mountPath: /data
+
+        # --- Sync Agent (periodic backups + shutdown hook) ---
+        - name: sync-agent
+          image: alpine:3.19
+          command:
+            - /bin/sh
+            - -c
+            - |
+              set -euo pipefail
+              apk add --no-cache rclone curl netcat-openbsd
+
+              echo "=== Sync agent started ==="
+
+              # SAFETY CHECK: Wait for Tailscale (up to 30s) then check if other server is running
+              echo "Waiting for Tailscale interface..."
+              for i in $(seq 1 30); do
+                if ip link show tailscale0 2>/dev/null; then
+                  echo "Tailscale is up after ${i}s"
+                  break
+                fi
+                sleep 1
+              done
+              if [ -n "$OTHER_TAILSCALE_IP" ] && nc -z -w 3 "$OTHER_TAILSCALE_IP" "$MINECRAFT_PORT" 2>/dev/null; then
+                echo "WARNING: $OTHER_SERVER_NAME is already running!"
+                echo "Both servers running simultaneously — world may fork."
+                echo "Whoever stops LAST will overwrite the other's progress."
+                curl -s -H "Content-Type: application/json" \
+                  -X POST "$DISCORD_WEBHOOK_URL" \
+                  -d "{\"embeds\":[{\"title\":\"⚠️ WARNING: Split-brain\",\"description\":\"**$SERVER_NAME** detected **$OTHER_SERVER_NAME** already online. Both Minecraft servers are running — world may fork. Whoever stops LAST will overwrite.\",\"color\":16755456,\"timestamp\":\"$(date -u +%Y%m%dT%H%M%SZ)\"}]}" > /dev/null
+              fi
+
+              # Notify Discord server is up
+              curl -s -H "Content-Type: application/json" \
+                -X POST "$DISCORD_WEBHOOK_URL" \
+                -d "{\"embeds\":[{\"title\":\"🟢 $SERVER_NAME is Online!\",\"description\":\"Minecraft server **$SERVER_NAME** is now live.\",\"color\":65280,\"timestamp\":\"$(date -u +%Y%m%dT%H%M%SZ)\"}]}" > /dev/null
+
+              # Start periodic backups (first after 60s, then every 5 min)
+              echo "Starting periodic backups (every 5 min)..."
+              sleep 60
+              while true; do
+                ts="periodic-$(date -u +%Y%m%d-%H%M%S)"
+                echo "[$ts] Backing up to cloud..."
+                rclone sync "$MINECRAFT_DIR/world" "$RCLONE_REMOTE/world" \
+                  --progress --verbose \
+                  --backup-dir "$RCLONE_REMOTE/backups/$ts"
+                echo "[$ts] Backup complete."
+                sleep 300
+              done
+          lifecycle:
+            preStop:
+              exec:
+                command:
+                  - /bin/sh
+                  - -c
+                  - |
+                    set -euo pipefail
+                    apk add --no-cache rclone rsync curl netcat-openbsd
+                    ts="shutdown-$(date -u +%Y%m%d-%H%M%S)"
+
+                    # Wait for Minecraft to finish saving
+                    echo "Waiting 15s for Minecraft to save world..."
+                    sleep 15
+
+                    # PRIMARY: Upload to cloud (always)
+                    echo "=== Uploading world to cloud ==="
+                    rclone sync "$MINECRAFT_DIR/world" "$RCLONE_REMOTE/world" \
+                      --progress --verbose \
+                      --backup-dir "$RCLONE_REMOTE/backups/$ts"
+                    echo "=== Upload complete ==="
+
+                    # OPTIMIZATION: Try rsync to friend (fast handoff if both stopped)
+                    if [ -n "$OTHER_TAILSCALE_IP" ]; then
+                      if ping -c 1 -W 2 "$OTHER_TAILSCALE_IP" &> /dev/null; then
+                        if ! nc -z -w 3 "$OTHER_TAILSCALE_IP" "$MINECRAFT_PORT" 2>/dev/null; then
+                          echo "=== Rsyncing world to $OTHER_SERVER_NAME ==="
+                          rsync -avz --progress \
+                            "$MINECRAFT_DIR/world" "$OTHER_TAILSCALE_IP:$MINECRAFT_DIR/world"
+                          echo "=== rsync complete ==="
+                        fi
+                      fi
+                    fi
+
+                    # Notify Discord
+                    curl -s -H "Content-Type: application/json" \
+                      -X POST "$DISCORD_WEBHOOK_URL" \
+                      -d "{\"embeds\":[{\"title\":\"🔴 $SERVER_NAME is Offline\",\"description\":\"Minecraft server **$SERVER_NAME** has shut down. World saved to cloud.\",\"color\":16711680,\"timestamp\":\"$(date -u +%Y%m%dT%H%M%SZ)\"}]}" > /dev/null
+                    echo "=== Server offline notification sent ==="
+          env:
+            - name: SERVER_NAME
+              value: "server-jinx"
+            - name: OTHER_SERVER_NAME
+              value: "server-agis"
+            - name: OTHER_TAILSCALE_IP
+              value: "100.x.x.x"
+            - name: MINECRAFT_DIR
+              value: /data
+            - name: MINECRAFT_PORT
+              value: "25565"
+            - name: RCLONE_REMOTE
+              value: "minecraft-b2:minecraft-world-bucket"
+            - name: DISCORD_WEBHOOK_URL
+              valueFrom:
+                secretKeyRef:
+                  name: discord-webhook
+                  key: url
+          volumeMounts:
+            - name: data
+              mountPath: /data
+            - name: rclone-config
+              mountPath: /root/.config/rclone
+          resources:
+            requests:
+              cpu: 200m
+              memory: 128Mi
+            limits:
+              cpu: 500m
+              memory: 256Mi
+
+        # --- Tailscale Sidecar ---
+        - name: tailscale
+          image: tailscale/tailscale:latest
+          env:
+            - name: TS_AUTHKEY
+              valueFrom:
+                secretKeyRef:
+                  name: tailscale-auth
+                  key: TS_AUTHKEY
+            - name: TS_HOSTNAME
+              value: "minecraft-server"
+            - name: TS_STATE_DIR
+              value: "/var/lib/tailscale"
+            - name: TS_KUBE_SECRET
+              value: ""
+            - name: TS_USERSPACE
+              value: "false"
+          securityContext:
+            privileged: true
+          volumeMounts:
+            - name: tailscale-state
+              mountPath: /var/lib/tailscale
+            - name: dev-net-tun
+              mountPath: /dev/net/tun
+          resources:
+            requests:
+              cpu: 200m
+              memory: 128Mi
+            limits:
+              cpu: 500m
+              memory: 256Mi
+
+      volumes:
+        - name: data
+          persistentVolumeClaim:
+            claimName: minecraft-data
+        - name: tailscale-state
+          persistentVolumeClaim:
+            claimName: tailscale-state
+        - name: dev-net-tun
+          hostPath:
+            path: /dev/net/tun
+        - name: rclone-config
+          secret:
+            secretName: rclone-config
+            items:
+              - key: rclone.conf
+                path: rclone/rclone.conf

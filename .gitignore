@@ -29,6 +29,10 @@ world/
 world_nether/
 world_the_end/
 
+# Sensitive config — never commit these
+*.secret.yaml
+*.secret.yml
+
 # OS files
 .DS_Store
 Thumbs.db
