@@ -1,5 +1,0 @@
-# Talos machine config patch — allow pods on control plane nodes
-# Usage: talosctl patch machineconfig --patch @allow-scheduling-patch.yaml
-- op: add
-  path: /cluster/allowSchedulingOnControlPlanes
-  value: true
