@@ -37,7 +37,7 @@ spec:
             - name: MINECRAFT_DIR
               value: /data
             - name: RCLONE_REMOTE
-              value: "minecraft-b2:minecraft-world-bucket"
+              value: "minecraft-b2:minecraft-world-sync"
           volumeMounts:
             - name: data
               mountPath: /data
@@ -99,6 +99,14 @@ spec:
                 fi
                 sleep 1
               done
+
+              # Get this pod's Tailscale IP
+              MY_TAILSCALE_IP=$(ip addr show tailscale0 2>/dev/null | grep inet | awk '{print $2}' | cut -d/ -f1)
+              if [ -z "$MY_TAILSCALE_IP" ]; then
+                MY_TAILSCALE_IP="unavailable"
+              fi
+              echo "My Tailscale IP: $MY_TAILSCALE_IP"
+
               if [ -n "$OTHER_TAILSCALE_IP" ] && nc -z -w 3 "$OTHER_TAILSCALE_IP" "$MINECRAFT_PORT" 2>/dev/null; then
                 echo "WARNING: $OTHER_SERVER_NAME is already running!"
                 echo "Both servers running simultaneously — world may fork."
@@ -108,10 +116,10 @@ spec:
                   -d "{\"embeds\":[{\"title\":\"⚠️ WARNING: Split-brain\",\"description\":\"**$SERVER_NAME** detected **$OTHER_SERVER_NAME** already online. Both Minecraft servers are running — world may fork. Whoever stops LAST will overwrite.\",\"color\":16755456,\"timestamp\":\"$(date -u +%Y%m%dT%H%M%SZ)\"}]}" > /dev/null
               fi
 
-              # Notify Discord server is up
+              # Notify Discord server is up — include Tailscale IP and connect instructions
               curl -s -H "Content-Type: application/json" \
                 -X POST "$DISCORD_WEBHOOK_URL" \
-                -d "{\"embeds\":[{\"title\":\"🟢 $SERVER_NAME is Online!\",\"description\":\"Minecraft server **$SERVER_NAME** is now live.\",\"color\":65280,\"timestamp\":\"$(date -u +%Y%m%dT%H%M%SZ)\"}]}" > /dev/null
+                -d "{\"embeds\":[{\"title\":\"🟢 $SERVER_NAME is Online!\",\"description\":\"**$SERVER_NAME** is now live.\\n\\n📡 **Tailscale IP:** \`$MY_TAILSCALE_IP\`\\n🎮 **Connect:** \`$MY_TAILSCALE_IP:$MINECRAFT_PORT\`\\n\\nJoin via Tailscale IP or the server's Tailscale hostname.\",\"color\":65280,\"timestamp\":\"$(date -u +%Y%m%dT%H%M%SZ)\"}]}" > /dev/null
 
               # Start periodic backups (first after 60s, then every 5 min)
               echo "Starting periodic backups (every 5 min)..."
@@ -159,10 +167,19 @@ spec:
                       fi
                     fi
 
+                    # Get Tailscale IP (still available during preStop)
+                    offline_ip=$(ip addr show tailscale0 2>/dev/null | grep inet | awk '{print $2}' | cut -d/ -f1)
+                    if [ -z "$offline_ip" ]; then
+                      offline_ip="unknown"
+                    fi
+                    # Get world size
+                    world_size=$(du -sh "$MINECRAFT_DIR/world" 2>/dev/null | cut -f1)
+                    [ -z "$world_size" ] && world_size="unknown"
+
                     # Notify Discord
                     curl -s -H "Content-Type: application/json" \
                       -X POST "$DISCORD_WEBHOOK_URL" \
-                      -d "{\"embeds\":[{\"title\":\"🔴 $SERVER_NAME is Offline\",\"description\":\"Minecraft server **$SERVER_NAME** has shut down. World saved to cloud.\",\"color\":16711680,\"timestamp\":\"$(date -u +%Y%m%dT%H%M%SZ)\"}]}" > /dev/null
+                      -d "{\"embeds\":[{\"title\":\"🔴 $SERVER_NAME is Offline\",\"description\":\"**$SERVER_NAME** has shut down.\\n📡 **Was at:** \`$offline_ip\`\\n💾 **World size:** $world_size\\n☁️ **Backed up** to cloud with \`--backup-dir\`\\n\\nThe other server can now be started safely.\",\"color\":16711680,\"timestamp\":\"$(date -u +%Y%m%dT%H%M%SZ)\"}]}" > /dev/null
                     echo "=== Server offline notification sent ==="
           env:
             - name: SERVER_NAME
@@ -176,7 +193,7 @@ spec:
             - name: MINECRAFT_PORT
               value: "25565"
             - name: RCLONE_REMOTE
-              value: "minecraft-b2:minecraft-world-bucket"
+              value: "minecraft-b2:minecraft-world-sync"
             - name: DISCORD_WEBHOOK_URL
               valueFrom:
                 secretKeyRef:
@@ -242,4 +259,4 @@ spec:
             secretName: rclone-config
             items:
               - key: rclone.conf
-                path: rclone/rclone.conf
+                path: rclone.conf

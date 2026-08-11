@@ -1,0 +1,12 @@
+# Talos machine config patch — add USB disk as a volume
+# Usage: talosctl patch machineconfig --patch @usb-volume-patch.yaml
+- op: add
+  path: /machine/volumes
+  value:
+    - name: minecraft-storage
+      provisioning:
+        diskSelector:
+          match: disk.transport == "usb"
+        minSize: 50GB
+      filesystem:
+        type: xfs

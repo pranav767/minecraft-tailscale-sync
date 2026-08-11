@@ -1,0 +1,163 @@
+apiVersion: apps/v1
+kind: StatefulSet
+metadata:
+  name: minecraft
+  namespace: minecraft
+  labels:
+    app: minecraft
+spec:
+  serviceName: minecraft
+  replicas: 1
+  selector:
+    matchLabels:
+      app: minecraft
+  template:
+    metadata:
+      labels:
+        app: minecraft
+    spec:
+      # Init container: sync world before Minecraft starts
+      initContainers:
+        - name: sync-pre-start
+          image: alpine:3.19
+          command:
+            - /bin/sh
+            - /scripts/sync.sh
+            - pre-start
+          env:
+            - name: SERVER_NAME
+              value: "server-a"  # Change per machine
+            - name: OTHER_SERVER_NAME
+              value: "server-b"
+            - name: OTHER_TAILSCALE_IP
+              value: "100.x.x.x"  # Friend's Tailscale IP
+            - name: MINECRAFT_DIR
+              value: /data
+            - name: RCLONE_REMOTE
+              value: "minecraft-b2:minecraft-world-bucket"
+            - name: DISCORD_WEBHOOK_URL
+              valueFrom:
+                secretKeyRef:
+                  name: discord-webhook
+                  key: url
+          volumeMounts:
+            - name: scripts
+              mountPath: /scripts
+            - name: data
+              mountPath: /data
+            - name: rclone-config
+              mountPath: /root/.config/rclone
+          resources:
+            requests:
+              cpu: 500m
+              memory: 512Mi
+            limits:
+              cpu: 1
+              memory: 1Gi
+
+      # Main containers
+      containers:
+        # --- Minecraft Server ---
+        - name: minecraft
+          image: itzg/minecraft-server:latest
+          ports:
+            - containerPort: 25565
+              name: minecraft
+          env:
+            - name: EULA
+              value: "TRUE"
+            - name: SERVER_NAME
+              value: "Minecraft Server"
+            - name: MEMORY
+              value: "4G"
+            - name: TYPE
+              value: "VANILLA"
+            - name: VERSION
+              value: "LATEST"
+            - name: DIFFICULTY
+              value: "normal"
+            - name: MAX_PLAYERS
+              value: "5"
+            - name: ONLINE_MODE
+              value: "FALSE"  # Set to TRUE if using Microsoft auth
+            - name: ALLOW_FLIGHT
+              value: "TRUE"
+            - name: SPAWN_PROTECTION
+              value: "0"
+          volumeMounts:
+            - name: data
+              mountPath: /data
+          lifecycle:
+            preStop:
+              exec:
+                command:
+                  - /bin/sh
+                  - /scripts/sync.sh
+                  - post-stop
+          resources:
+            requests:
+              cpu: 2
+              memory: 4Gi
+            limits:
+              cpu: 4
+              memory: 6Gi
+
+        # --- Tailscale Sidecar ---
+        - name: tailscale
+          image: tailscale/tailscale:latest
+          env:
+            - name: TS_AUTHKEY
+              valueFrom:
+                secretKeyRef:
+                  name: tailscale-auth
+                  key: authkey
+                  optional: true
+            - name: TS_HOSTNAME
+              value: "minecraft-$(SERVER_NAME)"
+            - name: TS_USERSPACE
+              value: "false"
+            - name: TS_STATE_DIR
+              value: /var/lib/tailscale
+          securityContext:
+            capabilities:
+              add:
+                - NET_ADMIN
+                - NET_RAW
+          volumeMounts:
+            - name: tailscale-state
+              mountPath: /var/lib/tailscale
+            - name: data
+              mountPath: /data
+          resources:
+            requests:
+              cpu: 200m
+              memory: 128Mi
+            limits:
+              cpu: 500m
+              memory: 256Mi
+
+      # Volumes
+      volumes:
+        - name: scripts
+          configMap:
+            name: sync-script
+            defaultMode: 0755
+        - name: rclone-config
+          secret:
+            secretName: rclone-config
+            items:
+              - key: rclone.conf
+                path: rclone/rclone.conf
+        - name: tailscale-state
+          emptyDir: {}
+
+  # Persistent storage for Minecraft world
+  volumeClaimTemplates:
+    - metadata:
+        name: data
+      spec:
+        accessModes: [ "ReadWriteOnce" ]
+        resources:
+          requests:
+            storage: 10Gi
+        # storageClassName: ""  # Uncomment if you need a specific storage class

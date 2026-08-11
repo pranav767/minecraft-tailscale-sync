@@ -20,7 +20,7 @@ DISCORD_WEBHOOK_URL="https://discord.com/api/webhooks/..."  # Replace with your 
 
 # rclone remote for cloud storage (configured with `rclone config`)
 # Used as source of truth + backup. Backblaze B2 ~$0.006/GB/month.
-RCLONE_REMOTE="minecraft-b2:minecraft-world-bucket"
+RCLONE_REMOTE="minecraft-b2:minecraft-world-sync"
 
 # ===== DISCORD WEBHOOK =====
 
@@ -112,6 +112,14 @@ is_other_server_online() {
     return $?
 }
 
+get_my_tailscale_ip() {
+    tailscale ip -4 2>/dev/null || echo "unavailable"
+}
+
+get_world_size() {
+    du -sh "$MINECRAFT_DIR/world" 2>/dev/null | cut -f1 || echo "unknown"
+}
+
 # ===== MAIN =====
 
 echo "=== Starting $SERVER_NAME ==="
@@ -120,7 +128,8 @@ echo "=== Starting $SERVER_NAME ==="
 if is_other_server_online; then
     echo "WARNING: $OTHER_SERVER_NAME is already running!"
     send_discord 16755456 "⚠️ Conflict" \
-        "**$SERVER_LABEL** tried to start but **$OTHER_SERVER_NAME** is already online!"
+        "**$SERVER_LABEL** tried to start but **$OTHER_SERVER_NAME** is already online at \`$OTHER_TAILSCALE_IP\`!
+Only one server should run at a time — world corruption risk. Stop the other server first."
     exit 1
 fi
 
@@ -136,8 +145,13 @@ else
 fi
 
 # 4. Notify Discord — server is starting
+MY_IP=$(get_my_tailscale_ip)
 send_discord 65280 "🟢 $SERVER_NAME is Online!" \
-    "Minecraft server **$SERVER_LABEL** is now live and ready for players."
+    "**$SERVER_LABEL** is now live and ready for players.
+📡 **Tailscale IP:** \`$MY_IP\`
+🎮 **Connect:** \`$MY_IP:$MINECRAFT_PORT\`
+
+Join via the Tailscale IP from your Minecraft client."
 
 # 5. Start periodic backups in background (every 5 min, first after 60s)
 periodic_backup_pid=""
@@ -179,7 +193,14 @@ upload_to_cloud
 try_rsync_to_other
 
 # 9. Notify Discord — server is offline
+MY_IP=$(get_my_tailscale_ip)
+WORLD_SIZE=$(get_world_size)
 send_discord 16711680 "🔴 $SERVER_NAME is Offline" \
-    "Minecraft server **$SERVER_LABEL** has shut down. World saved to cloud."
+    "**$SERVER_LABEL** has shut down.
+📡 **Was at:** \`$MY_IP\`
+💾 **World size:** $WORLD_SIZE
+☁️ **Backed up** to cloud with \`--backup-dir\`
+
+The other server can now be started safely."
 
 echo "=== $SERVER_NAME stopped ==="
