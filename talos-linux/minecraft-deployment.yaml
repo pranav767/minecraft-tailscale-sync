@@ -100,8 +100,8 @@ spec:
                 sleep 1
               done
 
-              # Get this pod's Tailscale IP
-              MY_TAILSCALE_IP=$(ip addr show tailscale0 2>/dev/null | grep inet | awk '{print $2}' | cut -d/ -f1)
+              # Get this pod's Tailscale IPv4 only
+              MY_TAILSCALE_IP=$(ip -4 addr show tailscale0 2>/dev/null | grep inet | awk '{print $2}' | cut -d/ -f1 | head -1)
               if [ -z "$MY_TAILSCALE_IP" ]; then
                 MY_TAILSCALE_IP="unavailable"
               fi
@@ -168,7 +168,7 @@ spec:
                     fi
 
                     # Get Tailscale IP (still available during preStop)
-                    offline_ip=$(ip addr show tailscale0 2>/dev/null | grep inet | awk '{print $2}' | cut -d/ -f1)
+                    offline_ip=$(ip -4 addr show tailscale0 2>/dev/null | grep inet | awk '{print $2}' | cut -d/ -f1 | head -1)
                     if [ -z "$offline_ip" ]; then
                       offline_ip="unknown"
                     fi
