@@ -128,9 +128,8 @@ spec:
               while true; do
                 ts="periodic-$(date -u +%Y%m%d-%H%M%S)"
                 echo "[$ts] Backing up to cloud..."
-                rclone sync "$MINECRAFT_DIR/world" "$RCLONE_REMOTE/world" \
-                  --checksum --progress --verbose \
-                  --backup-dir "$RCLONE_REMOTE/backups/$ts"
+                rclone copy "$MINECRAFT_DIR/world" "$RCLONE_REMOTE/backups/$ts" \
+                  --checksum --progress --verbose
                 echo "[$ts] Backup complete."
                 sleep 300
               done
