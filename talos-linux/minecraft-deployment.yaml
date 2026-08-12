@@ -31,7 +31,7 @@ spec:
 
               echo "=== Downloading world from cloud ==="
               rclone sync "$RCLONE_REMOTE/world" "$MINECRAFT_DIR/world" \
-                --progress --verbose
+                --checksum --progress --verbose
               echo "=== Download complete ==="
           env:
             - name: MINECRAFT_DIR
@@ -129,7 +129,7 @@ spec:
                 ts="periodic-$(date -u +%Y%m%d-%H%M%S)"
                 echo "[$ts] Backing up to cloud..."
                 rclone sync "$MINECRAFT_DIR/world" "$RCLONE_REMOTE/world" \
-                  --progress --verbose \
+                  --checksum --progress --verbose \
                   --backup-dir "$RCLONE_REMOTE/backups/$ts"
                 echo "[$ts] Backup complete."
                 sleep 300
@@ -151,7 +151,7 @@ spec:
                     # PRIMARY: Upload to cloud (always)
                     echo "=== Uploading world to cloud ==="
                     rclone sync "$MINECRAFT_DIR/world" "$RCLONE_REMOTE/world" \
-                      --progress --verbose \
+                      --checksum --progress --verbose \
                       --backup-dir "$RCLONE_REMOTE/backups/$ts" || echo "WARNING: rclone sync failed"
                     echo "=== Upload complete ==="
 

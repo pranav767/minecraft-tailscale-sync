@@ -90,7 +90,7 @@ try_rsync_to_other() {
 download_from_cloud() {
     echo "=== Downloading world from cloud ==="
     rclone sync "$RCLONE_REMOTE/world" "$MINECRAFT_DIR/world" \
-        --progress --verbose
+        --checksum --progress --verbose
     echo "=== Download complete ==="
 }
 
@@ -100,7 +100,7 @@ upload_to_cloud() {
     # Use sync + backup-dir: old versions of changed/deleted files are preserved
     local backup_path="$RCLONE_REMOTE/backups/$tag"
     rclone sync "$MINECRAFT_DIR/world" "$RCLONE_REMOTE/world" \
-        --progress --verbose \
+        --checksum --progress --verbose \
         --backup-dir "$backup_path"
     echo "=== Upload complete. Previous state backed up to $backup_path ==="
 }
