@@ -160,8 +160,8 @@ do_periodic_backups() {
     while true; do
         ts="periodic-$(date -u +%Y%m%d-%H%M%S)"
         echo "[$ts] Periodic backup..."
-        # Use copy to avoid file conflicts with Minecraft (read-only from source)
-        rclone copy "$MINECRAFT_DIR/world" "$RCLONE_REMOTE/backups/$ts" \
+        # Use copy (not sync) to the live world/ — never deletes, so no file conflicts
+        rclone copy "$MINECRAFT_DIR/world" "$RCLONE_REMOTE/world" \
             --checksum --progress --verbose
         echo "[$ts] Backup complete."
         sleep 300
