@@ -54,7 +54,7 @@ try_rsync_from_other() {
         return 1
     fi
     # Check if other server is running — rsync from a live server can cause corruption
-    if nc -z -w 3 "$OTHER_TAILSCALE_IP" "$MINECRAFT_PORT" 2>/dev/null; then
+    if is_other_server_online; then
         echo "WARNING: $OTHER_SERVER_NAME is still running! Skipping rsync (corruption risk)."
         return 1
     fi
@@ -74,7 +74,7 @@ try_rsync_to_other() {
         echo "No other Tailscale IP configured, skipping rsync."
         return 1
     fi
-    if nc -z -w 3 "$OTHER_TAILSCALE_IP" "$MINECRAFT_PORT" 2>/dev/null; then
+    if is_other_server_online; then
         echo "WARNING: $OTHER_SERVER_NAME is still running! Skipping rsync (corruption risk)."
         return 1
     fi
@@ -105,8 +105,10 @@ upload_to_cloud() {
 # ===== FUNCTIONS =====
 
 is_other_server_online() {
-    nc -z -w 3 "$OTHER_TAILSCALE_IP" "$MINECRAFT_PORT" 2>/dev/null
-    return $?
+    # nc doesn't work on Talos (no iptables in kernel).
+    # tailscale status doesn't show shared devices (cross-account).
+    # Use tailscale ping — if the device responds, it's online.
+    tailscale ping -c 1 -W 2 "$OTHER_TAILSCALE_IP" 2>/dev/null | grep -q "pong" && return 0 || return 1
 }
 
 get_my_tailscale_ip() {
