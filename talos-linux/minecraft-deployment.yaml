@@ -122,17 +122,36 @@ spec:
                 -X POST "$DISCORD_WEBHOOK_URL" \
                 -d "{\"embeds\":[{\"title\":\"🟢 $SERVER_NAME is Online!\",\"description\":\"**$SERVER_NAME** is now live.\\n\\n📡 **Tailscale IP:** \`$MY_TAILSCALE_IP\`\\n🎮 **Connect:** \`$MY_TAILSCALE_IP:$MINECRAFT_PORT\`\\n\\nJoin via Tailscale IP or the server's Tailscale hostname.\",\"color\":65280,\"timestamp\":\"$(date -u +%Y%m%dT%H%M%SZ)\"}]}" > /dev/null
 
-              # Start periodic backups (first after 60s, then every 5 min)
-              echo "Starting periodic backups (every 5 min)..."
-              sleep 60
+              # Start periodic backups — incremental sync every 30 min, full snapshot daily
+              echo "Starting periodic backups..."
+              # Track last daily snapshot date
+              last_snapshot_date=""
               while true; do
+                current_date="$(date -u +%Y%m%d)"
                 ts="periodic-$(date -u +%Y%m%d-%H%M%S)"
-                echo "[$ts] Backing up to cloud..."
-                # Use copy (not sync) to the live world/ — never deletes, so no file conflicts
+
+                # Incremental sync: only uploads changed files, no conflicts
+                echo "[$ts] Incremental sync..."
                 rclone copy "$MINECRAFT_DIR/world" "$RCLONE_REMOTE/world" \
                   --checksum --progress --verbose
-                echo "[$ts] Backup complete."
-                sleep 300
+                echo "[$ts] Sync complete."
+
+                # Daily snapshot: once per day, keep only last 2
+                if [ "$current_date" != "$last_snapshot_date" ]; then
+                  last_snapshot_date="$current_date"
+                  echo "[$ts] Daily snapshot to backups/$ts..."
+                  rclone copy "$MINECRAFT_DIR/world" "$RCLONE_REMOTE/backups/$ts" \
+                    --checksum --progress --verbose
+                  echo "[$ts] Snapshot complete."
+                  # Clean up old snapshots — keep only last 2
+                  echo "[$ts] Cleaning old snapshots (keeping last 2)..."
+                  rclone ls "$RCLONE_REMOTE/backups" 2>/dev/null | awk '{print $2}' | sort -n | head -n -2 | while read old; do
+                    rclone purge "$RCLONE_REMOTE/backups/$old" 2>/dev/null || true
+                  done
+                  echo "[$ts] Cleanup done."
+                fi
+
+                sleep 1800  # 30 min
               done
           lifecycle:
             preStop:
@@ -151,8 +170,7 @@ spec:
                     # PRIMARY: Upload to cloud (always)
                     echo "=== Uploading world to cloud ==="
                     rclone sync "$MINECRAFT_DIR/world" "$RCLONE_REMOTE/world" \
-                      --checksum --progress --verbose \
-                      --backup-dir "$RCLONE_REMOTE/backups/$ts" || echo "WARNING: rclone sync failed"
+                      --checksum --progress --verbose || echo "WARNING: rclone sync failed"
                     echo "=== Upload complete ==="
 
                     # OPTIMIZATION: Try rsync to friend (fast handoff if both stopped)
@@ -181,7 +199,7 @@ spec:
                     # Notify Discord
                     curl -s -H "Content-Type: application/json" \
                       -X POST "$DISCORD_WEBHOOK_URL" \
-                      -d "{\"embeds\":[{\"title\":\"🔴 $SERVER_NAME is Offline\",\"description\":\"**$SERVER_NAME** has shut down.\\n📡 **Was at:** \`$offline_ip\`\\n💾 **World size:** $world_size\\n☁️ **Backed up** to cloud with \`--backup-dir\`\\n\\nThe other server can now be started safely.\",\"color\":16711680,\"timestamp\":\"$(date -u +%Y%m%dT%H%M%SZ)\"}]}" > /dev/null || echo "WARNING: Discord notification failed"
+                      -d "{\"embeds\":[{\"title\":\"🔴 $SERVER_NAME is Offline\",\"description\":\"**$SERVER_NAME** has shut down.\\n📡 **Was at:** \`$offline_ip\`\\n💾 **World size:** $world_size\\n☁️ **World uploaded** to cloud\\n\\nThe other server can now be started safely.\",\"color\":16711680,\"timestamp\":\"$(date -u +%Y%m%dT%H%M%SZ)\"}]}" > /dev/null || echo "WARNING: Discord notification failed"
                     echo "=== Server offline notification sent ==="
           env:
             - name: SERVER_NAME
@@ -189,7 +207,7 @@ spec:
             - name: OTHER_SERVER_NAME
               value: "server-agis"
             - name: OTHER_TAILSCALE_IP
-              value: "100.x.x.x"
+              value: "100.89.107.101"
             - name: MINECRAFT_DIR
               value: /data
             - name: MINECRAFT_PORT

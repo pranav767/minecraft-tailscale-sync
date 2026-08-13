@@ -2,7 +2,7 @@
 # Minecraft Server Startup — Hybrid Cloud + rsync
 # Cloud is the SOURCE OF TRUTH. Rsync is a speed optimization for shutdown.
 # Periodic backups run every 5 min to limit data loss on power failure.
-# Always backs up world to cloud on shutdown with --backup-dir for safety.
+# Always backs up world to cloud on shutdown.
 
 # ===== CONFIGURATION =====
 SERVER_NAME="server-jinx"     # Change to "server-b" on friend's machine
@@ -97,12 +97,9 @@ download_from_cloud() {
 upload_to_cloud() {
     local tag="${1:-$(date -u +%Y%m%d-%H%M%S)}"
     echo "=== Uploading world to cloud (tag: $tag) ==="
-    # Use sync + backup-dir: old versions of changed/deleted files are preserved
-    local backup_path="$RCLONE_REMOTE/backups/$tag"
     rclone sync "$MINECRAFT_DIR/world" "$RCLONE_REMOTE/world" \
-        --checksum --progress --verbose \
-        --backup-dir "$backup_path"
-    echo "=== Upload complete. Previous state backed up to $backup_path ==="
+        --checksum --progress --verbose
+    echo "=== Upload complete ==="
 }
 
 # ===== FUNCTIONS =====
@@ -157,19 +154,38 @@ Join via the Tailscale IP from your Minecraft client."
 periodic_backup_pid=""
 do_periodic_backups() {
     sleep 60
+    last_snapshot_date=""
     while true; do
+        current_date="$(date -u +%Y%m%d)"
         ts="periodic-$(date -u +%Y%m%d-%H%M%S)"
-        echo "[$ts] Periodic backup..."
-        # Use copy (not sync) to the live world/ — never deletes, so no file conflicts
+
+        # Incremental sync: only uploads changed files, no conflicts
+        echo "[$ts] Incremental sync..."
         rclone copy "$MINECRAFT_DIR/world" "$RCLONE_REMOTE/world" \
             --checksum --progress --verbose
-        echo "[$ts] Backup complete."
-        sleep 300
+        echo "[$ts] Sync complete."
+
+        # Daily snapshot: once per day, keep only last 2
+        if [ "$current_date" != "$last_snapshot_date" ]; then
+            last_snapshot_date="$current_date"
+            echo "[$ts] Daily snapshot to backups/$ts..."
+            rclone copy "$MINECRAFT_DIR/world" "$RCLONE_REMOTE/backups/$ts" \
+                --checksum --progress --verbose
+            echo "[$ts] Snapshot complete."
+            # Clean up old snapshots — keep only last 2
+            echo "[$ts] Cleaning old snapshots (keeping last 2)..."
+            rclone ls "$RCLONE_REMOTE/backups" 2>/dev/null | awk '{print $2}' | sort -n | head -n -2 | while read old; do
+                rclone purge "$RCLONE_REMOTE/backups/$old" 2>/dev/null || true
+            done
+            echo "[$ts] Cleanup done."
+        fi
+
+        sleep 1800  # 30 min
     done
 }
 do_periodic_backups &
 periodic_backup_pid=$!
-echo "Periodic backups started (every 5 min, PID: $periodic_backup_pid)"
+echo "Periodic backups started (incremental 30min + daily snapshot, PID: $periodic_backup_pid)"
 
 # 6. Start the Minecraft server
 echo "=== Starting Minecraft server ==="
@@ -188,7 +204,7 @@ fi
 echo "Waiting 15s for Minecraft to save world..."
 sleep 15
 
-# 7. PRIMARY: Upload world to cloud (always — with --backup-dir for safety)
+# 7. PRIMARY: Upload world to cloud (always)
 echo "Backing up world to cloud..."
 upload_to_cloud
 
@@ -202,7 +218,7 @@ send_discord 16711680 "🔴 $SERVER_NAME is Offline" \
     "**$SERVER_LABEL** has shut down.
 📡 **Was at:** \`$MY_IP\`
 💾 **World size:** $WORLD_SIZE
-☁️ **Backed up** to cloud with \`--backup-dir\`
+☁️ **World uploaded** to cloud
 
 The other server can now be started safely."
 
