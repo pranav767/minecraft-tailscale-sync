@@ -19,8 +19,9 @@ JAVA_ARGS="-Xmx4G -Xms2G -jar $JAR_FILE nogui"
 DISCORD_WEBHOOK_URL="https://discord.com/api/webhooks/..."  # Replace with your webhook URL
 
 # rclone remote for cloud storage (configured with `rclone config`)
-# Used as source of truth + backup. Backblaze B2 ~$0.006/GB/month.
-RCLONE_REMOTE="minecraft-b2:minecraft-world-sync"
+# Google Drive 15GB free — no transaction limits like B2.
+# Create a remote named 'gdrive' via `rclone config` → drive.
+RCLONE_REMOTE="gdrive:minecraft-world-sync"
 
 # ===== DISCORD WEBHOOK =====
 
@@ -152,45 +153,35 @@ send_discord 65280 "🟢 $SERVER_NAME is Online!" \
 
 Join via the Tailscale IP from your Minecraft client."
 
-# 5. Start periodic backups in background (every 5 min, first after 60s)
-periodic_backup_pid=""
-do_periodic_backups() {
-    sleep 60
+# 5. Daily snapshot in background (world sync to cloud happens on shutdown — once per session)
+backup_pid=""
+do_daily_backup() {
+    # Wait 1 hour before first check, then snapshot once per day (keep latest 1)
+    sleep 3600
     last_snapshot_date=""
     while true; do
         current_date="$(date -u +%Y%m%d)"
-        ts="periodic-$(date -u +%Y%m%d-%H%M%S)"
-
-        # Incremental sync: only uploads changed files, no conflicts
-        echo "[$ts] Incremental sync..."
-        rclone copy "$MINECRAFT_DIR/world" "$RCLONE_REMOTE/world" \
-            --checksum --progress --verbose
-        echo "[$ts] Sync complete."
-
-        # Daily snapshot: once per day, keep only last 1
         if [ "$current_date" != "$last_snapshot_date" ]; then
             last_snapshot_date="$current_date"
-            echo "[$ts] Daily snapshot to backups/$ts..."
+            ts="snapshot-$(date -u +%Y%m%d-%H%M%S)"
+            echo "[$ts] Daily snapshot..."
             rclone copy "$MINECRAFT_DIR/world" "$RCLONE_REMOTE/backups/$ts" \
                 --checksum --progress --verbose
-            echo "[$ts] Snapshot complete."
-            # Clean up old snapshots — keep only latest 1
-            echo "[$ts] Cleaning old snapshots (keeping latest 1)..."
+            # Keep only latest 1 snapshot
             latest=$(rclone lsd "$RCLONE_REMOTE/backups" 2>/dev/null | awk '{print $NF}' | sort | tail -1)
             rclone lsd "$RCLONE_REMOTE/backups" 2>/dev/null | awk '{print $NF}' | sort | while read old; do
                 if [ -n "$old" ] && [ "$old" != "$latest" ]; then
                     rclone purge "$RCLONE_REMOTE/backups/$old" 2>/dev/null || true
                 fi
             done
-            echo "[$ts] Cleanup done."
+            echo "[$ts] Snapshot done (kept latest 1)."
         fi
-
-        sleep 1800  # 30 min
+        sleep 21600  # check every 6 hours
     done
 }
-do_periodic_backups &
-periodic_backup_pid=$!
-echo "Periodic backups started (incremental 30min + daily snapshot, PID: $periodic_backup_pid)"
+do_daily_backup &
+backup_pid=$!
+echo "Daily snapshot backup started (PID: $backup_pid)"
 
 # 6. Start the Minecraft server
 echo "=== Starting Minecraft server ==="
@@ -200,9 +191,9 @@ java $JAVA_ARGS
 # ===== ON SHUTDOWN =====
 echo "=== Server stopping... ==="
 
-# Kill the periodic backup process
-if [ -n "$periodic_backup_pid" ]; then
-    kill "$periodic_backup_pid" 2>/dev/null || true
+# Kill the daily backup process
+if [ -n "$backup_pid" ]; then
+    kill "$backup_pid" 2>/dev/null || true
 fi
 
 # Wait for Minecraft to finish saving

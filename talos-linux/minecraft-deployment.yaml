@@ -37,7 +37,7 @@ spec:
             - name: MINECRAFT_DIR
               value: /data
             - name: RCLONE_REMOTE
-              value: "minecraft-b2:minecraft-world-sync"
+              value: "gdrive:minecraft-world-sync"
           volumeMounts:
             - name: data
               mountPath: /data
@@ -124,40 +124,31 @@ spec:
                 -X POST "$DISCORD_WEBHOOK_URL" \
                 -d "{\"embeds\":[{\"title\":\"🟢 $SERVER_NAME is Online!\",\"description\":\"**$SERVER_NAME** is now live.\\n\\n📡 **Tailscale IP:** \`$MY_TAILSCALE_IP\`\\n🎮 **Connect:** \`$MY_TAILSCALE_IP:$MINECRAFT_PORT\`\\n\\nJoin via Tailscale IP or the server's Tailscale hostname.\",\"color\":65280,\"timestamp\":\"$(date -u +%Y%m%dT%H%M%SZ)\"}]}" > /dev/null
 
-              # Start periodic backups — incremental sync every 30 min, full snapshot daily
-              echo "Starting periodic backups..."
-              # Track last daily snapshot date
-              last_snapshot_date=""
-              while true; do
-                current_date="$(date -u +%Y%m%d)"
-                ts="periodic-$(date -u +%Y%m%d-%H%M%S)"
-
-                # Incremental sync: only uploads changed files, no conflicts
-                echo "[$ts] Incremental sync..."
-                rclone copy "$MINECRAFT_DIR/world" "$RCLONE_REMOTE/world" \
-                  --checksum --progress --verbose
-                echo "[$ts] Sync complete."
-
-                # Daily snapshot: once per day, keep only last 1
-                if [ "$current_date" != "$last_snapshot_date" ]; then
-                  last_snapshot_date="$current_date"
-                  echo "[$ts] Daily snapshot to backups/$ts..."
-                  rclone copy "$MINECRAFT_DIR/world" "$RCLONE_REMOTE/backups/$ts" \
-                    --checksum --progress --verbose
-                  echo "[$ts] Snapshot complete."
-                  # Clean up old snapshots — keep only latest 1
-                  echo "[$ts] Cleaning old snapshots (keeping latest 1)..."
-                  latest=$(rclone lsd "$RCLONE_REMOTE/backups" 2>/dev/null | awk '{print $NF}' | sort | tail -1)
-                  rclone lsd "$RCLONE_REMOTE/backups" 2>/dev/null | awk '{print $NF}' | sort | while read old; do
-                    if [ -n "$old" ] && [ "$old" != "$latest" ]; then
-                      rclone purge "$RCLONE_REMOTE/backups/$old" 2>/dev/null || true
-                    fi
-                  done
-                  echo "[$ts] Cleanup done."
-                fi
-
-                sleep 1800  # 30 min
-              done
+              # Daily snapshot in background — world sync happens on shutdown (once per session)
+              echo "Starting daily snapshot backup..."
+              (
+                sleep 3600  # wait 1 hour before first snapshot
+                last_snapshot_date=""
+                while true; do
+                  current_date="$(date -u +%Y%m%d)"
+                  if [ "$current_date" != "$last_snapshot_date" ]; then
+                    last_snapshot_date="$current_date"
+                    ts="snapshot-$(date -u +%Y%m%d-%H%M%S)"
+                    echo "[$ts] Daily snapshot..."
+                    rclone copy "$MINECRAFT_DIR/world" "$RCLONE_REMOTE/backups/$ts" \
+                      --checksum --progress --verbose
+                    # Keep only latest 1 snapshot
+                    latest=$(rclone lsd "$RCLONE_REMOTE/backups" 2>/dev/null | awk '{print $NF}' | sort | tail -1)
+                    rclone lsd "$RCLONE_REMOTE/backups" 2>/dev/null | awk '{print $NF}' | sort | while read old; do
+                      if [ -n "$old" ] && [ "$old" != "$latest" ]; then
+                        rclone purge "$RCLONE_REMOTE/backups/$old" 2>/dev/null || true
+                      fi
+                    done
+                    echo "[$ts] Snapshot done (kept latest 1)."
+                  fi
+                  sleep 21600  # check every 6 hours
+                done
+              ) &
           lifecycle:
             preStop:
               exec:
@@ -218,7 +209,7 @@ spec:
             - name: MINECRAFT_PORT
               value: "25565"
             - name: RCLONE_REMOTE
-              value: "minecraft-b2:minecraft-world-sync"
+              value: "gdrive:minecraft-world-sync"
             - name: DISCORD_WEBHOOK_URL
               valueFrom:
                 secretKeyRef:

@@ -45,17 +45,16 @@ Use your **Tailscale machine IP** on port **25565** (shown in Discord when it st
 ```
                     ┌──────────────────────────┐
                     │     Cloud Storage         │
-                    │   (Backblaze B2 / S3)     │
+                    │   (Google Drive 15GB)     │
                     │                           │
                     │     world/  ← SOURCE      │
                     │            OF TRUTH       │
                     │                           │
                     │     backups/              │
-                    │     └─ periodic-...       │
-                    │     └─ shutdown-...       │
+                    │     └─ snapshot-...       │
                     └──┬────────────────────┬───┘
                        │                    │
-          ↓ start: DOWNLOAD    shutdown: UPLOAD + backup-dir
+          ↓ start: DOWNLOAD    shutdown: UPLOAD
                        │                    │
               ┌────────┴──────┐    ┌───────┴────────┐
               │  Talos Linux  │    │    Ubuntu       │
@@ -86,7 +85,7 @@ This is the most important design decision in this repo. Here's **why** cloud is
 | Approach | Power loss? | Split-brain? | Large world? | Complexity |
 |---|---|---|---|---|
 | **Rsync first** | ❌ Data lost if machine dies before upload | ❌ Server A running, B rsyncs → corrupt | ❌ Timeouts, partial transfers | Simple |
-| **Cloud first (ours)** | ✅ At most 5 min lost (periodic backups) | ✅ Warned via Discord | ✅ Incremental rclone, 5-min grace | Moderate |
+| **Cloud first (ours)** | ✅ At most 1 session lost (no periodic) | ✅ Warned via Discord | ✅ Incremental rclone, 5-min grace | Moderate |
 
 **The rule:** Every server **always downloads from cloud on start** and **always uploads to cloud on stop**. Rsync is only used as a **speed optimization** on shutdown — if the other machine is reachable, it gets the world instantly instead of waiting for the next cloud download.
 
@@ -99,14 +98,14 @@ This is the most important design decision in this repo. Here's **why** cloud is
 3. Optional: rsync FROM friend (if reachable + stopped) for speed
 4. Minecraft starts
 5. Discord: 🟢 "Server A is Online!"
-6. Periodic backup sidecar starts — uploads to cloud every 5 min
-   (with --backup-dir, so old versions are saved in cloud/backups/)
+6. Daily snapshot background task starts — one snapshot per day kept
+   (old snapshots auto-purged, keeps latest 1)
 ```
 
 ### Server Stopping (graceful shutdown)
 ```
 1. Minecraft stops (15s wait for final save)
-2. rclone sync TO cloud/world  ← ALWAYS (with --backup-dir)
+2. rclone sync TO cloud/world  ← ALWAYS
 3. Optional: rsync TO friend (if reachable + stopped) for instant handoff
 4. Discord: 🔴 "Server A is Offline"
 ```
@@ -114,9 +113,9 @@ This is the most important design decision in this repo. Here's **why** cloud is
 ### Server Dies (power loss)
 ```
 1. preStop hook NEVER RUNS
-2. BUT: periodic backups ran every 5 min while server was running
-3. At most 5 minutes of progress is lost
-4. Friend starts their server → downloads from cloud → gets last periodic backup
+2. Cloud world is from the LAST CLEAN SHUTDOWN
+3. The entire session is lost (no periodic backups)
+4. Friend starts their server → downloads from cloud → gets last clean shutdown's world
 ```
 
 ## Failure Scenarios — What Can Go Wrong
@@ -124,11 +123,11 @@ This is the most important design decision in this repo. Here's **why** cloud is
 | # | Scenario | What happens | How bad? |
 |---|---|---|---|
 | 1 | **Normal handoff**: A→stop→B→start | A uploads to cloud. B downloads from cloud. Rsync to B for speed. | ✅ Safe |
-| 2 | **Power loss** 💥 | preStop lost. Periodic backups every 5 min save you. **Max 5 min lost.** | ⚠️ Minor |
-| 3 | **preStop timeout** (10GB upload) | 5-min grace period. `--backup-dir` keeps previous safe state in `backups/`. | ⚠️ Recoverable |
+| 2 | **Power loss** 💥 | preStop lost. Cloud world is from last clean shutdown. **Full session lost.** | ⚠️ Minor |
+| 3 | **preStop timeout** (huge world) | 5-min grace period. Old state safe in `backups/`. | ⚠️ Recoverable |
 | 4 | **Split-brain** (both running) | Sync-agent detects other's open port → **Discord warning**. Both run. **Whoever stops LAST overwrites the other. Manual fix needed.** | ⚠️ Requires manual restore |
 | 5 | **Corrupt cloud download** | Old state in `backups/`. Run: `rclone sync remote:backups/.../world ./world` to roll back. | ✅ Recoverable |
-| 6 | **First time ever** | Cloud has nothing → fresh world. First periodic backup uploads it. Friend downloads next start. | ✅ Fine |
+| 6 | **First time ever** | Cloud has nothing → fresh world. First shutdown uploads it. Friend downloads next start. | ✅ Fine |
 
 ### How to recover from split-brain (Scenario 4)
 
@@ -138,7 +137,7 @@ If both servers accidentally run at once:
 # 1. Stop both servers
 # 2. Decide whose progress to keep (whoever played last)
 # 3. On the LOSING machine, restore from the WINNING server's backup:
-rclone sync minecraft-b2:minecraft-world-bucket/backups/shutdown-20260811-235959/world ./world
+rclone sync gdrive:minecraft-world-sync/backups/snapshot-20260813-.../world ./world
 # 4. Start only the winning server
 ```
 
@@ -169,19 +168,35 @@ sudo tailscale up
 
 ### 2. Set up rclone on both machines
 
+**Google Drive** is used for cloud storage — 15GB free, no transaction limits (unlike Backblaze B2 which charges per-API-call and caps free storage at 10GB).
+
 ```bash
 # Install rclone
 sudo -v ; curl https://rclone.org/install.sh | sudo bash
 
-# Configure your storage provider (Backblaze B2 recommended — ~$0.006/GB/month)
+# Configure Google Drive remote (OAuth — you'll get a URL to authorize)
 rclone config
+# → n (new remote)
+# → name: gdrive
+# → Storage: drive
+# → client_id: (leave blank)
+# → client_secret: (leave blank)
+# → scope: drive
+# → root_folder_id: (leave blank)
+# → service_account_file: (leave blank)
+# → Edit advanced config? n
+# → Use auto config? y   ← opens browser to authorize with your Google account
+# → Configure this as a Shared Drive? n
+# → y (yes this is OK)
 ```
 
 Test it:
 ```bash
-rclone mkdir minecraft-b2:minecraft-world-bucket
-rclone ls minecraft-b2:minecraft-world-bucket
+rclone mkdir gdrive:minecraft-world-sync
+rclone ls gdrive:minecraft-world-sync
 ```
+
+> ⚠️ **Important**: Both machines must authorize with the **same Google account** and use the **same remote name** (`gdrive`). The rclone config file contains the auth token — share the `rclone.conf` between machines (see Talos setup below).
 
 ### 3. Create a Discord webhook
 
@@ -223,7 +238,7 @@ MINECRAFT_DIR="/opt/minecraft/server"
 JAR_FILE="server.jar"                # Your Minecraft server jar
 JAVA_ARGS="-Xmx4G -Xms2G -jar $JAR_FILE nogui"
 DISCORD_WEBHOOK_URL="https://discord.com/api/webhooks/..."
-RCLONE_REMOTE="minecraft-b2:minecraft-world-bucket"
+RCLONE_REMOTE="gdrive:minecraft-world-sync"
 ```
 
 ### 2.4 Set up the Minecraft server
@@ -311,7 +326,7 @@ The `minecraft-deployment.yaml` runs three containers in one pod:
 | Container | Role |
 |---|---|
 | **minecraft** | `itzg/minecraft-server` — the actual game server |
-| **sync-agent** | Alpine container running rclone. Handles periodic backups (every 5 min) + preStop shutdown hook. Also checks for split-brain via Tailscale. |
+| **sync-agent** | Alpine container running rclone. Handles daily snapshot + preStop shutdown hook. Also checks for split-brain via Tailscale. |
 | **tailscale** | Tailscale sidecar — connects the pod to your Tailnet |
 
 Plus an **init container** (`sync-pre-start`) that downloads the world from cloud before Minecraft starts.
@@ -335,7 +350,7 @@ kubectl -n games rollout restart deployment minecraft
 # View all container logs
 kubectl -n games logs -l app=minecraft
 
-# Watch sync agent logs (periodic backups, Discord)
+# Watch sync agent logs (daily snapshot, Discord)
 kubectl -n games logs -l app=minecraft -c sync-agent -f
 
 # Watch Minecraft server logs
@@ -367,13 +382,13 @@ Or connect via the Talos node IP on port **30565** (NodePort).
 | Scenario | Data loss | Why |
 |---|---|---|
 | Graceful shutdown | **None** | preStop uploads to cloud |
-| Power loss | **≤5 minutes** | Periodic backup ran within last 5 min |
-| preStop timeout (huge world) | **Previous backup safe** | `--backup-dir` preserves old state |
+| Power loss | **Full session** | No periodic backups — last clean shutdown world is safe |
+| preStop timeout (huge world) | **Previous backup safe** | Old state in `backups/` |
 | Both run at once | **Depends on who stops last** | Manual recovery needed |
 
 ### Transfer speeds
 
-| World Size | Cloud download (init) | Cloud backup (periodic) | Rsync to friend |
+| World Size | Cloud download (init) | Cloud upload (shutdown) | Rsync to friend |
 |---|---|---|---|
 | 100 MB | ~30s | ~1-5s | ~1s |
 | 500 MB | ~2min | ~5-15s | ~3s |
@@ -388,20 +403,20 @@ All times are incremental — after the first sync, only changed chunks are tran
 
 ```bash
 # List available backups in cloud
-rclone ls minecraft-b2:minecraft-world-bucket/backups/
+rclone ls gdrive:minecraft-world-sync/backups/
 
 # Restore from a specific backup (Ubuntu)
 cd /opt/minecraft/server
-rclone sync minecraft-b2:minecraft-world-bucket/backups/shutdown-20260811-235959/world ./world
+rclone sync gdrive:minecraft-world-sync/backups/snapshot-20260813-.../world ./world
 
 # Restore from a specific backup (Talos)
 kubectl -n games exec deploy/minecraft -c sync-agent -- \
-  rclone sync minecraft-b2:minecraft-world-bucket/backups/shutdown-20260811-235959/world /data/world
+  rclone sync gdrive:minecraft-world-sync/backups/snapshot-20260813-.../world /data/world
 
 # Manual restore using helper pod (Talos)
 kubectl apply -f talos-linux/mc-restore-helper.yaml
 kubectl -n games exec mc-restore-helper -- \
-  rclone sync minecraft-b2:minecraft-world-bucket/backups/.../world /data/world
+  rclone sync gdrive:minecraft-world-sync/backups/.../world /data/world
 kubectl delete pod mc-restore-helper
 ```
 
