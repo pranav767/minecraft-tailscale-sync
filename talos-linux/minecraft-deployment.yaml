@@ -237,6 +237,25 @@ spec:
         # --- Tailscale Sidecar ---
         - name: tailscale
           image: tailscale/tailscale:latest
+          command:
+            - /bin/sh
+            - -c
+            - |
+              # Start tailscale, then set up serve proxy for Minecraft
+              /usr/local/bin/containerboot &
+              # Wait for tailscale to be up
+              for i in $(seq 1 60); do
+                if tailscale status &>/dev/null; then
+                  break
+                fi
+                sleep 1
+              done
+              sleep 5
+              # Proxy inbound Tailscale traffic to Minecraft port
+              echo "Setting up tailscale serve for Minecraft..."
+              tailscale serve --bg tcp:25565 || echo "serve setup failed (may already be set)"
+              tailscale serve status || true
+              wait
           env:
             - name: TS_AUTHKEY
               valueFrom:
@@ -250,7 +269,7 @@ spec:
             - name: TS_KUBE_SECRET
               value: ""
             - name: TS_USERSPACE
-              value: "false"
+              value: "true"
           securityContext:
             privileged: true
           volumeMounts:

@@ -105,10 +105,10 @@ upload_to_cloud() {
 # ===== FUNCTIONS =====
 
 is_other_server_online() {
-    # nc doesn't work on Talos (no iptables in kernel).
-    # tailscale status doesn't show shared devices (cross-account).
-    # Use tailscale ping — if the device responds, it's online.
-    tailscale ping -c 1 -W 2 "$OTHER_TAILSCALE_IP" 2>/dev/null | grep -q "pong" && return 0 || return 1
+    # Check if the OTHER server's Minecraft port is open.
+    # Both machines are on the same tailnet now, so TCP works directly.
+    nc -z -w 3 "$OTHER_TAILSCALE_IP" "$MINECRAFT_PORT" 2>/dev/null
+    return $?
 }
 
 get_my_tailscale_ip() {
