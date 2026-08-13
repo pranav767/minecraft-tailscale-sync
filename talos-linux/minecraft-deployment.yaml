@@ -37,7 +37,7 @@ spec:
             - name: MINECRAFT_DIR
               value: /data
             - name: RCLONE_REMOTE
-              value: "gdrive:minecraft-world-sync"
+              value: "minecraft-gdrive:minecraft-world-sync"
           volumeMounts:
             - name: data
               mountPath: /data
@@ -209,7 +209,7 @@ spec:
             - name: MINECRAFT_PORT
               value: "25565"
             - name: RCLONE_REMOTE
-              value: "gdrive:minecraft-world-sync"
+              value: "minecraft-gdrive:minecraft-world-sync"
             - name: DISCORD_WEBHOOK_URL
               valueFrom:
                 secretKeyRef:

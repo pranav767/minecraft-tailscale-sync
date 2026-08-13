@@ -21,7 +21,7 @@ DISCORD_WEBHOOK_URL="https://discord.com/api/webhooks/..."  # Replace with your 
 # rclone remote for cloud storage (configured with `rclone config`)
 # Google Drive 15GB free — no transaction limits like B2.
 # Create a remote named 'gdrive' via `rclone config` → drive.
-RCLONE_REMOTE="gdrive:minecraft-world-sync"
+RCLONE_REMOTE="minecraft-gdrive:minecraft-world-sync"
 
 # ===== DISCORD WEBHOOK =====
 

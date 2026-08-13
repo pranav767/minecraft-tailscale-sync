@@ -137,7 +137,7 @@ If both servers accidentally run at once:
 # 1. Stop both servers
 # 2. Decide whose progress to keep (whoever played last)
 # 3. On the LOSING machine, restore from the WINNING server's backup:
-rclone sync gdrive:minecraft-world-sync/backups/snapshot-20260813-.../world ./world
+rclone sync minecraft-gdrive:minecraft-world-sync/backups/snapshot-20260813-.../world ./world
 # 4. Start only the winning server
 ```
 
@@ -177,7 +177,7 @@ sudo -v ; curl https://rclone.org/install.sh | sudo bash
 # Configure Google Drive remote (OAuth — you'll get a URL to authorize)
 rclone config
 # → n (new remote)
-# → name: gdrive
+# → name: minecraft-gdrive
 # → Storage: drive
 # → client_id: (leave blank)
 # → client_secret: (leave blank)
@@ -192,8 +192,8 @@ rclone config
 
 Test it:
 ```bash
-rclone mkdir gdrive:minecraft-world-sync
-rclone ls gdrive:minecraft-world-sync
+rclone mkdir minecraft-gdrive:minecraft-world-sync
+rclone ls minecraft-gdrive:minecraft-world-sync
 ```
 
 > ⚠️ **Important**: Both machines must authorize with the **same Google account** and use the **same remote name** (`gdrive`). The rclone config file contains the auth token — share the `rclone.conf` between machines (see Talos setup below).
@@ -238,7 +238,7 @@ MINECRAFT_DIR="/opt/minecraft/server"
 JAR_FILE="server.jar"                # Your Minecraft server jar
 JAVA_ARGS="-Xmx4G -Xms2G -jar $JAR_FILE nogui"
 DISCORD_WEBHOOK_URL="https://discord.com/api/webhooks/..."
-RCLONE_REMOTE="gdrive:minecraft-world-sync"
+RCLONE_REMOTE="minecraft-gdrive:minecraft-world-sync"
 ```
 
 ### 2.4 Set up the Minecraft server
@@ -403,20 +403,20 @@ All times are incremental — after the first sync, only changed chunks are tran
 
 ```bash
 # List available backups in cloud
-rclone ls gdrive:minecraft-world-sync/backups/
+rclone ls minecraft-gdrive:minecraft-world-sync/backups/
 
 # Restore from a specific backup (Ubuntu)
 cd /opt/minecraft/server
-rclone sync gdrive:minecraft-world-sync/backups/snapshot-20260813-.../world ./world
+rclone sync minecraft-gdrive:minecraft-world-sync/backups/snapshot-20260813-.../world ./world
 
 # Restore from a specific backup (Talos)
 kubectl -n games exec deploy/minecraft -c sync-agent -- \
-  rclone sync gdrive:minecraft-world-sync/backups/snapshot-20260813-.../world /data/world
+  rclone sync minecraft-gdrive:minecraft-world-sync/backups/snapshot-20260813-.../world /data/world
 
 # Manual restore using helper pod (Talos)
 kubectl apply -f talos-linux/mc-restore-helper.yaml
 kubectl -n games exec mc-restore-helper -- \
-  rclone sync gdrive:minecraft-world-sync/backups/.../world /data/world
+  rclone sync minecraft-gdrive:minecraft-world-sync/backups/.../world /data/world
 kubectl delete pod mc-restore-helper
 ```
 
