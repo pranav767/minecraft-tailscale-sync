@@ -138,17 +138,20 @@ spec:
                   --checksum --progress --verbose
                 echo "[$ts] Sync complete."
 
-                # Daily snapshot: once per day, keep only last 2
+                # Daily snapshot: once per day, keep only last 1
                 if [ "$current_date" != "$last_snapshot_date" ]; then
                   last_snapshot_date="$current_date"
                   echo "[$ts] Daily snapshot to backups/$ts..."
                   rclone copy "$MINECRAFT_DIR/world" "$RCLONE_REMOTE/backups/$ts" \
                     --checksum --progress --verbose
                   echo "[$ts] Snapshot complete."
-                  # Clean up old snapshots — keep only last 2
-                  echo "[$ts] Cleaning old snapshots (keeping last 2)..."
-                  rclone ls "$RCLONE_REMOTE/backups" 2>/dev/null | awk '{print $2}' | sort -n | head -n -2 | while read old; do
-                    rclone purge "$RCLONE_REMOTE/backups/$old" 2>/dev/null || true
+                  # Clean up old snapshots — keep only latest 1
+                  echo "[$ts] Cleaning old snapshots (keeping latest 1)..."
+                  latest=$(rclone lsd "$RCLONE_REMOTE/backups" 2>/dev/null | awk '{print $NF}' | sort | tail -1)
+                  rclone lsd "$RCLONE_REMOTE/backups" 2>/dev/null | awk '{print $NF}' | sort | while read old; do
+                    if [ -n "$old" ] && [ "$old" != "$latest" ]; then
+                      rclone purge "$RCLONE_REMOTE/backups/$old" 2>/dev/null || true
+                    fi
                   done
                   echo "[$ts] Cleanup done."
                 fi
