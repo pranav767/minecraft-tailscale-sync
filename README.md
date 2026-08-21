@@ -1,8 +1,8 @@
 # Minecraft Tailscale Sync 🎮
 
-Two-player Minecraft sync across **Talos Linux** (Kubernetes) and **Ubuntu** (bare metal).
+Multi-player Minecraft sync across **Talos Linux** (Kubernetes) and **Ubuntu** (bare metal).
 
-You and a friend run separate Minecraft servers on your own machines. This setup keeps the world in sync no matter which server is running — with a **cloud-first** architecture that prioritizes data safety over speed.
+Up to **6-7 players** can play at a time. Only one server runs at a time. The world syncs via **Google Drive** — download on start, upload on stop. Simple.
 
 ## Quick Command Reference
 
@@ -18,14 +18,7 @@ You and a friend run separate Minecraft servers on your own machines. This setup
 | Machine | Command |
 |---|---|
 | **Talos** | `kubectl -n games scale deployment minecraft --replicas=0` |
-| **Ubuntu** | Press `Ctrl+C` or `kill` the process — backup happens automatically |
-
-### 🔄 Restart (stop + backup + download + start)
-
-| Machine | Command |
-|---|---|
-| **Talos** | `kubectl -n games rollout restart deployment minecraft` |
-| **Ubuntu** | `Ctrl+C` then `./start-minecraft.sh` again |
+| **Ubuntu** | Press `Ctrl+C` — backup happens automatically |
 
 ### 📋 Check Status
 
@@ -49,114 +42,66 @@ Use your **Tailscale machine IP** on port **25565** (shown in Discord when it st
                     │                           │
                     │     world/  ← SOURCE      │
                     │            OF TRUTH       │
-                    │                           │
-                    │     backups/              │
-                    │     └─ snapshot-...       │
-                    └──┬────────────────────┬───┘
-                       │                    │
-          ↓ start: DOWNLOAD    shutdown: UPLOAD
-                       │                    │
-              ┌────────┴──────┐    ┌───────┴────────┐
-              │  Talos Linux  │    │    Ubuntu       │
-              │  (Server A)   │    │  (Server B)     │
-              │               │    │                 │
-              │  Kubernetes   │    │  bare metal     │
-              │  itzg/mc-srv  │    │  vanilla java   │
-              │  Tailscale    │    │  Tailscale      │
-              │  sidecar      │    │  rclone + rsync │
-              └───────┬───────┘    └───────┬─────────┘
-                      │                    │
-                      │  rsync ◄─────────► │
-                      │  (shutdown only)   │
-                      └────────────────────┘
-
-                        Discord Webhook
-                        ┌──────────────┐
-                        │ 🟢 Online!   │
-                        │ 🔴 Offline!  │
-                        │ ⚠️ Conflict! │
-                        └──────────────┘
+                    └──────┬────────────────┬───┘
+                           │                │
+              ↓ start: DOWNLOAD   stop: UPLOAD
+                           │                │
+                  ┌────────┴──────┐  ┌─────┴──────────┐
+                  │  Talos Linux  │  │    Ubuntu       │
+                  │  (Server A)   │  │  (Server B)     │
+                  │               │  │                 │
+                  │  Kubernetes   │  │  bare metal     │
+                  │  itzg/mc-srv  │  │  vanilla java   │
+                  │  Tailscale    │  │  Tailscale      │
+                  │  sidecar      │  │  rclone         │
+                  └───────┬───────┘  └───────┬─────────┘
+                          │                  │
+                          └──────┬──────┬────┘
+                                 │      │
+                           Discord Webhook
+                           ┌──────────────┐
+                           │ 🟢 Online!   │
+                           │ 🔴 Offline!  │
+                           └──────────────┘
 ```
 
-## Philosophy: Cloud is the Source of Truth
-
-This is the most important design decision in this repo. Here's **why** cloud is the source of truth (not rsync):
-
-| Approach | Power loss? | Split-brain? | Large world? | Complexity |
-|---|---|---|---|---|
-| **Rsync first** | ❌ Data lost if machine dies before upload | ❌ Server A running, B rsyncs → corrupt | ❌ Timeouts, partial transfers | Simple |
-| **Cloud first (ours)** | ✅ At most 1 session lost (no periodic) | ✅ Warned via Discord | ✅ Incremental rclone, 5-min grace | Moderate |
-
-**The rule:** Every server **always downloads from cloud on start** and **always uploads to cloud on stop**. Rsync is only used as a **speed optimization** on shutdown — if the other machine is reachable, it gets the world instantly instead of waiting for the next cloud download.
-
-## How Sync Works — Step by Step
+## How It Works
 
 ### Server Starting
 ```
 1. Init container (K8s) / script (Ubuntu) starts
-2. rclone sync FROM cloud/world → local world/  ← ALWAYS
-3. Optional: rsync FROM friend (if reachable + stopped) for speed
-4. Minecraft starts
-5. Discord: 🟢 "Server A is Online!"
-6. Daily snapshot background task starts — one snapshot per day kept
-   (old snapshots auto-purged, keeps latest 1)
+2. rclone sync FROM cloud/world → local world/
+3. Minecraft starts
+4. Discord: 🟢 "Server is Online!"
 ```
 
-### Server Stopping (graceful shutdown)
+### Server Stopping
 ```
-1. Minecraft stops (15s wait for final save)
-2. rclone sync TO cloud/world  ← ALWAYS
-3. Optional: rsync TO friend (if reachable + stopped) for instant handoff
-4. Discord: 🔴 "Server A is Offline"
-```
-
-### Server Dies (power loss)
-```
-1. preStop hook NEVER RUNS
-2. Cloud world is from the LAST CLEAN SHUTDOWN
-3. The entire session is lost (no periodic backups)
-4. Friend starts their server → downloads from cloud → gets last clean shutdown's world
+1. Minecraft stops (Ctrl+C or scale to 0)
+2. Wait 15s for world save
+3. rclone sync local world/ → cloud/world
+4. Discord: 🔴 "Server is Offline"
+5. Other machine can now start safely
 ```
 
-## Failure Scenarios — What Can Go Wrong
+That's it. No rsync, no periodic backups, no daily snapshots. Cloud is the source of truth.
 
-| # | Scenario | What happens | How bad? |
-|---|---|---|---|
-| 1 | **Normal handoff**: A→stop→B→start | A uploads to cloud. B downloads from cloud. Rsync to B for speed. | ✅ Safe |
-| 2 | **Power loss** 💥 | preStop lost. Cloud world is from last clean shutdown. **Full session lost.** | ⚠️ Minor |
-| 3 | **preStop timeout** (huge world) | 5-min grace period. Old state safe in `backups/`. | ⚠️ Recoverable |
-| 4 | **Split-brain** (both running) | Sync-agent detects other's open port → **Discord warning**. Both run. **Whoever stops LAST overwrites the other. Manual fix needed.** | ⚠️ Requires manual restore |
-| 5 | **Corrupt cloud download** | Old state in `backups/`. Run: `rclone sync remote:backups/.../world ./world` to roll back. | ✅ Recoverable |
-| 6 | **First time ever** | Cloud has nothing → fresh world. First shutdown uploads it. Friend downloads next start. | ✅ Fine |
+## Why This Simplicity
 
-### How to recover from split-brain (Scenario 4)
+| Concern | How it's handled |
+|---|---|
+| **6-7 players** | 2.5-3GB RAM allocated, PaperMC for performance |
+| **World sync** | Download on start, upload on stop — always |
+| **Data loss risk** | At most 1 session lost (if machine dies before upload) |
+| **Split-brain** | Don't run both servers at once. Discord tells you when it's online/offline |
+| **Backup** | Every shutdown uploads to cloud. That's your backup. |
+| **Power failure** | Rare. If it happens, the last successful upload is your world. |
 
-If both servers accidentally run at once:
+## Setup
 
-```bash
-# 1. Stop both servers
-# 2. Decide whose progress to keep (whoever played last)
-# 3. On the LOSING machine, restore from the WINNING server's backup:
-rclone sync minecraft-gdrive:minecraft-world-sync/backups/snapshot-20260813-.../world ./world
-# 4. Start only the winning server
-```
+### Prerequisites (Both Machines)
 
-## Setup Overview
-
-This repo supports **two different machine types**:
-
-| Machine | OS | How Minecraft runs | Sync method |
-|---|---|---|---|
-| **Server A** (yours) | **Talos Linux** | Kubernetes (itzg/minecraft-server) | K8s Deployment with init container + sidecar |
-| **Server B** (friend's) | **Ubuntu** | Vanilla java server | Bash script (start-minecraft.sh) |
-
-Both connect to the **same cloud bucket** and the **same Tailscale network**.
-
----
-
-## Part 1: Prerequisites (Both Machines)
-
-### 1. Install Tailscale on both machines
+#### 1. Install Tailscale
 
 **Ubuntu:**
 ```bash
@@ -164,11 +109,9 @@ curl -fsSL https://tailscale.com/install.sh | sh
 sudo tailscale up
 ```
 
-**Talos Linux:** Already handled by the K8s sidecar (see Talos setup below).
+**Talos Linux:** Handled by the K8s sidecar (see Talos setup below).
 
-### 2. Set up rclone on both machines
-
-**Google Drive** is used for cloud storage — 15GB free, no transaction limits (unlike Backblaze B2 which charges per-API-call and caps free storage at 10GB).
+#### 2. Set up rclone with Google Drive
 
 ```bash
 # Install rclone
@@ -224,74 +167,47 @@ git clone https://github.com/pranav767/minecraft-tailscale-sync.git /opt/minecra
 cd /opt/minecraft
 ```
 
-### 2.3 Configure `start-minecraft.sh`
-
-Edit the configuration section at the top:
+### Ubuntu Server Setup
 
 ```bash
-SERVER_NAME="server-agis"           # Unique name for this server
-SERVER_LABEL="Agis's Server"         # Friendly name for Discord
-OTHER_SERVER_NAME="server-jinx"      # The other server's name
-OTHER_TAILSCALE_IP="100.x.x.x"       # Talos server's Tailscale IP
-MINECRAFT_PORT=25565
-MINECRAFT_DIR="/opt/minecraft/server"
-JAR_FILE="server.jar"                # Your Minecraft server jar
-JAVA_ARGS="-Xmx4G -Xms2G -jar $JAR_FILE nogui"
-DISCORD_WEBHOOK_URL="https://discord.com/api/webhooks/..."
-RCLONE_REMOTE="minecraft-gdrive:minecraft-world-sync"
-```
+# Install dependencies
+sudo apt update
+sudo apt install -y openjdk-21-jre-headless curl
 
-### 2.4 Set up the Minecraft server
+# Clone repo
+git clone https://github.com/pranav767/minecraft-tailscale-sync.git /opt/minecraft
+cd /opt/minecraft
 
-```bash
+# Edit configuration — set SERVER_NAME, SERVER_LABEL, RCLONE_REMOTE,
+# DISCORD_WEBHOOK_URL, and JAVA_ARGS at the top of the script
+
+# Download PaperMC server
 mkdir -p /opt/minecraft/server
 cd /opt/minecraft/server
-# Download your server.jar (Paper, Vanilla, etc.)
-wget https://api.papermc.io/v2/projects/paper/versions/1.21.1/builds/.../downloads/paper-...jar -O server.jar
-# Accept EULA
+# Download paper-1.21.1.jar (or latest version)
 echo "eula=true" > eula.txt
 chmod +x /opt/minecraft/start-minecraft.sh
-```
 
-### 2.5 Start/Stop
-
-```bash
-# 🟢 Start server (downloads world from cloud, notifies Discord)
+# Start (downloads world from cloud, notifies Discord)
 cd /opt/minecraft && ./start-minecraft.sh
 
-# 🔴 Stop server (press Ctrl+C or send SIGTERM)
-# The script handles: cloud backup → rsync to friend → Discord notification
+# Stop with Ctrl+C — uploads world to cloud automatically
 ```
 
-That's it. The script does everything automatically.
+### Talos Linux Setup
 
----
-
-## Part 3: Talos Linux (Your Machine)
-
-Talos doesn't allow SSH — everything runs in Kubernetes via `kubectl`.
-
-### 3.1 Talos machine patches (one-time)
-
-Apply these patches to mount the USB storage and allow scheduling on control plane:
+#### Machine Patches (one-time)
 
 ```bash
-# Note: use 'patch' not 'apply-config' — these are partial patches, not full configs
 talosctl patch machineconfig --patch @talos-linux/usb-volume-patch.yaml
 talosctl patch machineconfig --patch @talos-linux/allow-scheduling-patch.yaml
-```
-
-After patching, reboot the Talos node for the USB disk to be detected:
-```bash
 talosctl reboot
 ```
 
-### 3.2 Create secrets
-
-Run these from your local machine (where `kubectl` is configured):
+#### Create Secrets
 
 ```bash
-# rclone config (from your machine where rclone is already configured)
+# rclone config
 kubectl create secret generic rclone-config \
   --namespace games \
   --from-file=rclone.conf=$HOME/.config/rclone/rclone.conf
@@ -301,16 +217,15 @@ kubectl create secret generic discord-webhook \
   --namespace games \
   --from-literal=url="https://discord.com/api/webhooks/..."
 
-# Tailscale auth key (create one at https://login.tailscale.com/admin/settings/authkeys)
+# Tailscale auth key (create at https://login.tailscale.com/admin/settings/authkeys)
 kubectl create secret generic tailscale-auth \
   --namespace games \
   --from-literal=TS_AUTHKEY="tskey-auth-xxxxxxxxxxxx"
 ```
 
-### 3.3 Apply Kubernetes manifests
+#### Apply Manifests
 
 ```bash
-# In order:
 kubectl apply -f talos-linux/pv.yaml
 kubectl apply -f talos-linux/tailscale-pv.yaml
 kubectl apply -f talos-linux/pvc.yaml
@@ -319,118 +234,67 @@ kubectl apply -f talos-linux/minecraft-deployment.yaml
 kubectl apply -f talos-linux/minecraft-service.yaml
 ```
 
-### 3.4 What the K8s deployment contains
-
-The `minecraft-deployment.yaml` runs three containers in one pod:
+#### K8s Pod Architecture
 
 | Container | Role |
 |---|---|
-| **minecraft** | `itzg/minecraft-server` — the actual game server |
-| **sync-agent** | Alpine container running rclone. Handles daily snapshot + preStop shutdown hook. Also checks for split-brain via Tailscale. |
-| **tailscale** | Tailscale sidecar — connects the pod to your Tailnet |
+| **minecraft** | `itzg/minecraft-server` — PaperMC with 2.5GB RAM |
+| **sync-agent** | Discord notifications + preStop shutdown hook (upload to cloud) |
+| **tailscale** | Tailscale sidecar — connects pod to your tailnet |
 
-Plus an **init container** (`sync-pre-start`) that downloads the world from cloud before Minecraft starts.
+Plus an **init container** that downloads world from cloud before Minecraft starts.
 
-### 3.5 Start/Stop
+#### Start/Stop
 
 ```bash
-# 🟢 Start server (downloads world from cloud, notifies Discord)
+# 🟢 Start
 kubectl -n games scale deployment minecraft --replicas=1
 
-# 🔴 Stop server (triggers cloud backup → rsync → Discord notification)
+# 🔴 Stop
 kubectl -n games scale deployment minecraft --replicas=0
 
-# 🔄 Restart (stop → backup → download world → start)
-kubectl -n games rollout restart deployment minecraft
-```
-
-### 3.6 Monitoring
-
-```bash
-# View all container logs
-kubectl -n games logs -l app=minecraft
-
-# Watch sync agent logs (daily snapshot, Discord)
-kubectl -n games logs -l app=minecraft -c sync-agent -f
-
-# Watch Minecraft server logs
+# View logs
 kubectl -n games logs -l app=minecraft -c minecraft -f
+kubectl -n games logs -l app=minecraft -c sync-agent -f
 ```
 
-### 3.7 Connect
+#### Connect
 
-Use the **Tailscale IP** of the pod on port **25565**. The IP is shown in the Discord message when the server starts.
-
-Or connect via the Talos node IP on port **30565** (NodePort).
+Use the **Tailscale IP** of the pod on port **25565** (shown in Discord when server starts). Or use the Talos node IP on port **30565** (NodePort).
 
 ---
 
-## Part 4: Discord Notifications
+## Discord Notifications
 
 | Event | Color | Message |
 |---|---|---|
-| Server started | 🟢 Green | "Server A is Online!" |
-| Server stopped | 🔴 Red | "Server A is Offline. World saved to cloud." |
-| Split-brain detected | 🟡 Orange | Warning that both servers are running simultaneously |
+| Server started | 🟢 Green | "Server is Online!" with Tailscale IP |
+| Server stopped | 🔴 Red | "Server is Offline. World uploaded to cloud." |
 
 ---
 
-## Part 5: Performance & Data Safety
+## Failure Scenarios
 
-### How much data can you lose?
-
-| Scenario | Data loss | Why |
-|---|---|---|
-| Graceful shutdown | **None** | preStop uploads to cloud |
-| Power loss | **Full session** | No periodic backups — last clean shutdown world is safe |
-| preStop timeout (huge world) | **Previous backup safe** | Old state in `backups/` |
-| Both run at once | **Depends on who stops last** | Manual recovery needed |
-
-### Transfer speeds
-
-| World Size | Cloud download (init) | Cloud upload (shutdown) | Rsync to friend |
-|---|---|---|---|
-| 100 MB | ~30s | ~1-5s | ~1s |
-| 500 MB | ~2min | ~5-15s | ~3s |
-| 2 GB | ~5min | ~10-30s | ~10s |
-| 10 GB | ~25min | ~30s-2min | ~45s |
-
-All times are incremental — after the first sync, only changed chunks are transferred.
+| Scenario | Impact |
+|---|---|
+| **Graceful shutdown** | ✅ World saved to cloud |
+| **Power loss** | ⚠️ Session lost. Last clean upload is safe |
+| **Both run at once** | ⚠️ Whoever stops last overwrites. Check Discord to avoid |
+| **Corrupt world** | ✅ Restore from cloud world/ or use mc-restore-helper |
 
 ---
 
-## Part 6: Recovery Commands
+## Files
 
-```bash
-# List available backups in cloud
-rclone ls minecraft-gdrive:minecraft-world-sync/backups/
-
-# Restore from a specific backup (Ubuntu)
-cd /opt/minecraft/server
-rclone sync minecraft-gdrive:minecraft-world-sync/backups/snapshot-20260813-.../world ./world
-
-# Restore from a specific backup (Talos)
-kubectl -n games exec deploy/minecraft -c sync-agent -- \
-  rclone sync minecraft-gdrive:minecraft-world-sync/backups/snapshot-20260813-.../world /data/world
-
-# Manual restore using helper pod (Talos)
-kubectl apply -f talos-linux/mc-restore-helper.yaml
-kubectl -n games exec mc-restore-helper -- \
-  rclone sync minecraft-gdrive:minecraft-world-sync/backups/.../world /data/world
-kubectl delete pod mc-restore-helper
-```
-
----
-
-## File Reference
-
-| File | Used on | Purpose |
-|---|---|---|
-| `start-minecraft.sh` | **Ubuntu** | Bash script with full sync logic (cloud + rsync + Discord) |
-| `talos-linux/minecraft-deployment.yaml` | **Talos** | K8s Deployment (Minecraft server + sync-agent + Tailscale) |
-| `talos-linux/minecraft-service.yaml` | **Talos** | NodePort service on port 30565 |
-| `talos-linux/pv.yaml` / `talos-linux/pvc.yaml` | **Talos** | USB persistent storage for world data |
-| `talos-linux/tailscale-pv.yaml` / `talos-linux/tailscale-state-pvc.yaml` | **Talos** | Tailscale state persistence |
-| `talos-linux/usb-volume-patch.yaml` | **Talos** | Machine config patch to mount USB disk |
-| `talos-linux/allow-scheduling-patch.yaml` | **Talos** | Machine config patch for control plane scheduling |
-| `talos-linux/mc-restore-helper.yaml` | **Talos** | Helper pod for manual world restore |
+| File | Purpose |
+|---|---|
+| `start-minecraft.sh` | Ubuntu startup/shutdown script |
+| `talos-linux/minecraft-deployment.yaml` | K8s deployment (Minecraft + sync + Tailscale) |
+| `talos-linux/minecraft-service.yaml` | K8s NodePort service |
+| `talos-linux/pv.yaml` | USB storage PersistentVolume |
+| `talos-linux/pvc.yaml` | USB storage PersistentVolumeClaim |
+| `talos-linux/tailscale-pv.yaml` | Tailscale state PV |
+| `talos-linux/tailscale-state-pvc.yaml` | Tailscale state PVC |
+| `talos-linux/allow-scheduling-patch.yaml` | Allow pods on control plane |
+| `talos-linux/usb-volume-patch.yaml` | Mount USB disk in Talos |
+| `talos-linux/mc-restore-helper.yaml` | Debug pod for manual restore |

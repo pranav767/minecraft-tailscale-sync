@@ -15,10 +15,9 @@ spec:
       labels:
         app: minecraft
     spec:
-      # Give preStop hooks time to upload large worlds (5 min)
       terminationGracePeriodSeconds: 300
 
-      # Init container: download world from cloud (no Tailscale needed)
+      # Init container: download world from cloud on start
       initContainers:
         - name: sync-pre-start
           image: alpine:3.19
@@ -28,7 +27,6 @@ spec:
             - |
               set -euo pipefail
               apk add --no-cache rclone
-
               echo "=== Downloading world from cloud ==="
               rclone sync "$RCLONE_REMOTE/world" "$MINECRAFT_DIR/world" \
                 --checksum --progress --verbose
@@ -59,7 +57,7 @@ spec:
             - name: EULA
               value: "TRUE"
             - name: MEMORY
-              value: "1536M"
+              value: "2560M"
             - name: TYPE
               value: "PAPER"
             - name: VERSION
@@ -70,15 +68,15 @@ spec:
             - containerPort: 25565
           resources:
             requests:
-              memory: "1536Mi"
+              memory: "2048Mi"
               cpu: "500m"
             limits:
-              memory: "2048Mi"
+              memory: "3072Mi"
           volumeMounts:
             - name: data
               mountPath: /data
 
-        # --- Sync Agent (periodic backups + shutdown hook) ---
+        # --- Sync Agent (shutdown hook only) ---
         - name: sync-agent
           image: alpine:3.19
           command:
@@ -86,12 +84,11 @@ spec:
             - -c
             - |
               set -euo pipefail
-              # Install packages once at startup (not in preStop — that times out)
-              apk add --no-cache rclone rsync curl netcat-openbsd
+              apk add --no-cache rclone curl
 
               echo "=== Sync agent started ==="
 
-              # SAFETY CHECK: Wait for Tailscale (up to 30s) then check if other server is running
+              # Wait for Tailscale (up to 30s)
               echo "Waiting for Tailscale interface..."
               for i in $(seq 1 30); do
                 if ip link show tailscale0 2>/dev/null; then
@@ -101,54 +98,18 @@ spec:
                 sleep 1
               done
 
-              # Get this pod's Tailscale IPv4 only
+              # Get Tailscale IP
               MY_TAILSCALE_IP=$(ip -4 addr show tailscale0 2>/dev/null | grep inet | awk '{print $2}' | cut -d/ -f1 | head -1)
-              if [ -z "$MY_TAILSCALE_IP" ]; then
-                MY_TAILSCALE_IP="unavailable"
-              fi
+              [ -z "$MY_TAILSCALE_IP" ] && MY_TAILSCALE_IP="unavailable"
               echo "My Tailscale IP: $MY_TAILSCALE_IP"
 
-              if [ -n "$OTHER_TAILSCALE_IP" ] && nc -z -w 3 "$OTHER_TAILSCALE_IP" "$MINECRAFT_PORT" 2>/dev/null; then
-                echo "WARNING: $OTHER_SERVER_NAME is already running!"
-                echo "Both servers running simultaneously — world may fork."
-                echo "Whoever stops LAST will overwrite the other's progress."
-                echo "Both servers running simultaneously — world may fork."
-                echo "Whoever stops LAST will overwrite the other's progress."
-                curl -s -H "Content-Type: application/json" \
-                  -X POST "$DISCORD_WEBHOOK_URL" \
-                  -d "{\"embeds\":[{\"title\":\"⚠️ WARNING: Split-brain\",\"description\":\"**$SERVER_NAME** detected **$OTHER_SERVER_NAME** already online. Both Minecraft servers are running — world may fork. Whoever stops LAST will overwrite.\",\"color\":16755456,\"timestamp\":\"$(date -u +%Y%m%dT%H%M%SZ)\"}]}" > /dev/null
-              fi
-
-              # Notify Discord server is up — include Tailscale IP and connect instructions
+              # Notify Discord server is up
               curl -s -H "Content-Type: application/json" \
                 -X POST "$DISCORD_WEBHOOK_URL" \
-                -d "{\"embeds\":[{\"title\":\"🟢 $SERVER_NAME is Online!\",\"description\":\"**$SERVER_NAME** is now live.\\n\\n📡 **Tailscale IP:** \`$MY_TAILSCALE_IP\`\\n🎮 **Connect:** \`$MY_TAILSCALE_IP:$MINECRAFT_PORT\`\\n\\nJoin via Tailscale IP or the server's Tailscale hostname.\",\"color\":65280,\"timestamp\":\"$(date -u +%Y%m%dT%H%M%SZ)\"}]}" > /dev/null
+                -d "{\"embeds\":[{\"title\":\"🟢 $SERVER_NAME is Online!\",\"description\":\"**$SERVER_NAME** is now live.\\n\\n📡 **Tailscale IP:** \`$MY_TAILSCALE_IP\`\\n🎮 **Connect:** \`$MY_TAILSCALE_IP:$MINECRAFT_PORT\`\\n\\nJoin via the Tailscale IP from your Minecraft client.\",\"color\":65280,\"timestamp\":\"$(date -u +%Y%m%dT%H%M%SZ)\"}]}" > /dev/null
 
-              # Daily snapshot in background — world sync happens on shutdown (once per session)
-              echo "Starting daily snapshot backup..."
-              (
-                sleep 3600  # wait 1 hour before first snapshot
-                last_snapshot_date=""
-                while true; do
-                  current_date="$(date -u +%Y%m%d)"
-                  if [ "$current_date" != "$last_snapshot_date" ]; then
-                    last_snapshot_date="$current_date"
-                    ts="snapshot-$(date -u +%Y%m%d-%H%M%S)"
-                    echo "[$ts] Daily snapshot..."
-                    rclone copy "$MINECRAFT_DIR/world" "$RCLONE_REMOTE/backups/$ts" \
-                      --checksum --progress --verbose
-                    # Keep only latest 1 snapshot
-                    latest=$(rclone lsd "$RCLONE_REMOTE/backups" 2>/dev/null | awk '{print $NF}' | sort | tail -1)
-                    rclone lsd "$RCLONE_REMOTE/backups" 2>/dev/null | awk '{print $NF}' | sort | while read old; do
-                      if [ -n "$old" ] && [ "$old" != "$latest" ]; then
-                        rclone purge "$RCLONE_REMOTE/backups/$old" 2>/dev/null || true
-                      fi
-                    done
-                    echo "[$ts] Snapshot done (kept latest 1)."
-                  fi
-                  sleep 21600  # check every 6 hours
-                done
-              ) &
+              # Sleep forever — preStop handles shutdown
+              sleep infinity
           lifecycle:
             preStop:
               exec:
@@ -156,39 +117,23 @@ spec:
                   - /bin/sh
                   - -c
                   - |
-                    # Don't use set -e — we want to try everything even if something fails
-                    ts="shutdown-$(date -u +%Y%m%d-%H%M%S)"
-
                     # Wait for Minecraft to finish saving
                     echo "Waiting 15s for Minecraft to save world..."
                     sleep 15
 
-                    # PRIMARY: Upload to cloud (always)
+                    # Upload world to cloud (source of truth)
                     echo "=== Uploading world to cloud ==="
                     rclone sync "$MINECRAFT_DIR/world" "$RCLONE_REMOTE/world" \
                       --checksum --progress --verbose || echo "WARNING: rclone sync failed"
                     echo "=== Upload complete ==="
 
-                    # OPTIMIZATION: Try rsync to friend (fast handoff if both stopped)
-                    if [ -n "$OTHER_TAILSCALE_IP" ]; then
-                      if ping -c 1 -W 2 "$OTHER_TAILSCALE_IP" &> /dev/null; then
-                        if ! nc -z -w 3 "$OTHER_TAILSCALE_IP" "$MINECRAFT_PORT" 2>/dev/null; then
-                          echo "=== Rsyncing world to $OTHER_SERVER_NAME ==="
-                          rsync -avz --progress \
-                            "$MINECRAFT_DIR/world" "$OTHER_TAILSCALE_IP:$MINECRAFT_DIR/world" || echo "WARNING: rsync failed"
-                          echo "=== rsync complete ==="
-                        fi
-                      fi
-                    fi
-
-                    # Get Tailscale IP (may be gone if tailscale container already stopped)
+                    # Get Tailscale IP
                     offline_ip="unknown"
                     if ip -4 addr show tailscale0 2>/dev/null; then
                       offline_ip=$(ip -4 addr show tailscale0 2>/dev/null | grep inet | awk '{print $2}' | cut -d/ -f1 | head -1)
                     fi
                     [ -z "$offline_ip" ] && offline_ip="unknown"
 
-                    # Get world size
                     world_size=$(du -sh "$MINECRAFT_DIR/world" 2>/dev/null | cut -f1)
                     [ -z "$world_size" ] && world_size="unknown"
 
@@ -200,10 +145,6 @@ spec:
           env:
             - name: SERVER_NAME
               value: "server-jinx"
-            - name: OTHER_SERVER_NAME
-              value: "server-agis"
-            - name: OTHER_TAILSCALE_IP
-              value: "100.89.107.101"
             - name: MINECRAFT_DIR
               value: /data
             - name: MINECRAFT_PORT
@@ -222,11 +163,11 @@ spec:
               mountPath: /root/.config/rclone
           resources:
             requests:
+              cpu: 100m
+              memory: 64Mi
+            limits:
               cpu: 200m
               memory: 128Mi
-            limits:
-              cpu: 500m
-              memory: 256Mi
 
         # --- Tailscale Sidecar ---
         - name: tailscale
